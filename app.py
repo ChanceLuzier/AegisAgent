@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Callable, Tuple
 
 import numpy as np
 import requests
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -97,7 +97,28 @@ _last_error: str = ""
 
 _tts = None
 _tts_ready = False
-_active_voice: str = KOKORO_VOICE
+
+_PREFS_FILE = os.path.join(DIRECTOR_DIR, "data", "user_prefs.json")
+
+def _load_prefs() -> Dict[str, Any]:
+    try:
+        with open(_PREFS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_prefs(prefs: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(_PREFS_FILE), exist_ok=True)
+        with open(_PREFS_FILE, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+    except Exception:
+        pass
+
+_active_voice: str = _load_prefs().get("voice", KOKORO_VOICE)
+
+_stt_model = None
+_stt_ready = False
 
 _app_ready = False
 _app_ready_detail = "Starting..."
@@ -751,6 +772,54 @@ def _looks_like_useless(text: str) -> bool:
         return True
     return False
 
+def _strip_tool_echoes(text: str) -> str:
+    """Remove [Tool:xxx] {...} / [...] blocks the LLM echoes back, handling any nesting depth."""
+    result: List[str] = []
+    i = 0
+    pattern = re.compile(r'\[Tool:\w+\]\s*')
+    while i < len(text):
+        m = pattern.search(text, i)
+        if not m:
+            result.append(text[i:])
+            break
+        result.append(text[i:m.start()])
+        i = m.end()
+        # Scan past the balanced JSON object/array that follows
+        if i < len(text) and text[i] in ('{', '['):
+            openers = {'{': '}', '[': ']'}
+            closers = set(openers.values())
+            depth, in_str, escape = 0, False, False
+            while i < len(text):
+                c = text[i]
+                if escape:
+                    escape = False
+                elif c == '\\' and in_str:
+                    escape = True
+                elif c == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if c in openers:
+                        depth += 1
+                    elif c in closers:
+                        depth -= 1
+                        if depth == 0:
+                            i += 1
+                            break
+                i += 1
+            if i < len(text) and text[i] == '\n':
+                i += 1
+    cleaned = ''.join(result)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+_ACTION_CLAIM_RE = re.compile(
+    r"I(?:'ve| have)(?: just| successfully)? (?:created|written|deleted|moved|renamed|made|saved|run|executed)",
+    re.IGNORECASE,
+)
+
+def _looks_like_action_claim(text: str) -> bool:
+    return bool(_ACTION_CLAIM_RE.search(text))
+
 # ----------------------------
 # Approval helper
 # ----------------------------
@@ -897,6 +966,16 @@ def _agent_run(session_id: str, auto_voice: bool) -> Dict[str, Any]:
     if executed_any_tool and (_looks_like_useless(last_assistant_text)):
         if last_tool_name and isinstance(last_tool_result, dict):
             last_assistant_text = _tool_result_human(last_tool_name, last_tool_result)
+
+    last_assistant_text = _strip_tool_echoes(last_assistant_text)
+
+    # Catch hallucinated actions — if the model claims to have done something without calling a tool, reject it
+    if not executed_any_tool and _looks_like_action_claim(last_assistant_text):
+        last_assistant_text = (
+            "I wasn’t able to do that — I need to use a tool to perform file operations, "
+            "and I didn’t call one. Please ask again and I’ll use the appropriate tool "
+            "(file writes require your approval before anything is changed)."
+        )
 
     if not last_assistant_text.strip():
         last_assistant_text = _force_final_answer(agent_msgs) or "I didn’t get a response from the model. Please try again."
@@ -1327,7 +1406,40 @@ def api_settings_post(payload: Dict[str, Any] = Body(...)) -> Any:
     if voice not in _VALID_VOICES:
         return JSONResponse(status_code=400, content={"error": f"Invalid voice: {voice}"})
     _active_voice = voice
+    _save_prefs({**_load_prefs(), "voice": voice})
     return {"ok": True, "voice": _active_voice}
+
+def _init_stt() -> None:
+    global _stt_model, _stt_ready
+    if _stt_ready:
+        return
+    from faster_whisper import WhisperModel
+    _stt_model = WhisperModel("small.en", device="cpu", compute_type="int8")
+    _stt_ready = True
+
+@app.post("/api/stt", response_class=JSONResponse)
+async def api_stt(audio: UploadFile = File(...)) -> Any:
+    if not _app_ready:
+        return JSONResponse(status_code=503, content={"error": "Server not ready"})
+    try:
+        _init_stt()
+        import tempfile
+        suffix = ".wav"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir=TMP_DIR) as tmp:
+            tmp.write(await audio.read())
+            tmp_path = tmp.name
+        try:
+            segments, _ = _stt_model.transcribe(tmp_path, language="en")
+            text = " ".join(seg.text.strip() for seg in segments).strip()
+            return {"text": text}
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+    except Exception as e:
+        _set_last_error(e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/api/tools/mcp", response_class=JSONResponse)
 def api_tools_mcp() -> Any:
@@ -1736,6 +1848,76 @@ def ui() -> str:
     }}
     .switch.on .knob {{ left: 23px; }}
 
+    /* Mic button */
+    #micBtn {{
+      transition: background 120ms, box-shadow 120ms;
+    }}
+    #micBtn.recording {{
+      background: rgba(218,54,51,0.75);
+      box-shadow: 0 0 0 3px rgba(218,54,51,0.3);
+      animation: micpulse 1.2s ease-in-out infinite;
+    }}
+    @keyframes micpulse {{
+      0%, 100% {{ box-shadow: 0 0 0 3px rgba(218,54,51,0.3); }}
+      50%  {{ box-shadow: 0 0 0 7px rgba(218,54,51,0.08); }}
+    }}
+
+    /* Voice Orb */
+    #voiceOrbWrap {{
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 10px 0 8px;
+      width: 100%;
+      background: transparent;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }}
+    #voiceOrbContainer {{
+      position: relative;
+      width: 150px;
+      height: 150px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    #orbCanvas {{
+      position: absolute;
+      top: 0; left: 0;
+      pointer-events: none;
+      z-index: 0;
+      background: transparent;
+    }}
+    #voiceOrb {{
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      position: relative;
+      z-index: 1;
+      background: radial-gradient(circle at 30% 30%, rgba(255,165,70,0.80), rgba(200,75,10,0.88) 55%, rgba(55,18,3,0.92));
+      box-shadow: 0 0 16px 5px rgba(210,100,20,0.32);
+      animation: orbIdle 3s ease-in-out infinite;
+      transition: background 0.4s ease, box-shadow 0.4s ease;
+    }}
+    #voiceOrb.user-speaking {{
+      background: radial-gradient(circle at 35% 35%, #60b4ff, #1a6fd4 55%, #0a3a7a);
+      box-shadow: 0 0 24px 8px rgba(60,140,255,0.45), 0 0 44px 14px rgba(30,100,220,0.18);
+      animation: orbPulse 0.9s ease-in-out infinite;
+    }}
+    #voiceOrb.llm-speaking {{
+      background: radial-gradient(circle at 35% 35%, #ffcc66, #e87c20 55%, #7a3600);
+      box-shadow: 0 0 24px 8px rgba(240,140,40,0.50), 0 0 44px 14px rgba(200,100,20,0.20);
+      animation: orbPulse 1.1s ease-in-out infinite;
+    }}
+    @keyframes orbIdle {{
+      0%, 100% {{ transform: scale(1);    box-shadow: 0 0 16px 5px rgba(210,100,20,0.30); }}
+      50%       {{ transform: scale(1.04); box-shadow: 0 0 24px 8px rgba(210,100,20,0.45); }}
+    }}
+    @keyframes orbPulse {{
+      0%, 100% {{ transform: scale(1);    }}
+      50%       {{ transform: scale(1.10); }}
+    }}
+
     /* Waveform speaking indicator */
     .waveform {{
       display: none;
@@ -1825,6 +2007,12 @@ def ui() -> str:
 
 <div class="app" id="appRoot">
   <div class="sidebar">
+    <div id="voiceOrbWrap">
+      <div id="voiceOrbContainer">
+        <canvas id="orbCanvas" width="150" height="150"></canvas>
+        <div id="voiceOrb"></div>
+      </div>
+    </div>
     <div class="sidebarHeader">
       <div class="row" style="justify-content: space-between;">
         <strong>Sessions</strong>
@@ -1880,6 +2068,7 @@ def ui() -> str:
         <textarea id="msg" placeholder="Type... (Enter to send • Shift+Enter for newline)"></textarea>
       </div>
       <div class="row" style="margin-top:10px; justify-content:flex-end;">
+        <button class="secondary" id="micBtn" title="Toggle voice input">🎤</button>
         <button class="secondary" id="voiceLast">Voice Last</button>
         <button id="send">Send</button>
       </div>
@@ -2139,9 +2328,87 @@ function clearChat() {{
 }}
 
 const waveform = document.getElementById("waveform");
-player.addEventListener("play",  () => waveform.classList.add("speaking"));
-player.addEventListener("ended", () => waveform.classList.remove("speaking"));
-player.addEventListener("pause", () => waveform.classList.remove("speaking"));
+const voiceOrbWrap = document.getElementById("voiceOrbWrap");
+const voiceOrb = document.getElementById("voiceOrb");
+const orbCanvas = document.getElementById("orbCanvas");
+const orbCtx = orbCanvas.getContext("2d");
+
+// ---- Orb particle system ----
+const _ORB_R = 32, _CANVAS_SZ = 150;
+let _orbParticles = [], _orbAnimFrame = null, _orbState = "idle";
+
+function _makeParticle(state) {{
+  const idle = state === "idle";
+  return {{
+    angle: Math.random() * Math.PI * 2,
+    radius: idle ? _ORB_R + 8 + Math.random() * 16 : _ORB_R + 10 + Math.random() * 28,
+    speed: (idle ? 0.004 + Math.random() * 0.006 : 0.011 + Math.random() * 0.022) * (Math.random() < 0.5 ? 1 : -1),
+    size: idle ? 1.0 + Math.random() * 1.4 : 1.4 + Math.random() * 2.4,
+    opacity: idle ? 0.15 + Math.random() * 0.22 : 0.35 + Math.random() * 0.55,
+    drift: (Math.random() - 0.5) * (idle ? 0.001 : 0.005),
+  }};
+}}
+
+function _spawnParticles(state) {{
+  const count = state === "idle" ? 20 : 32;
+  _orbParticles = Array.from({{ length: count }}, () => _makeParticle(state));
+}}
+
+function _orbDraw() {{
+  orbCtx.clearRect(0, 0, _CANVAS_SZ, _CANVAS_SZ);
+  const cx = _CANVAS_SZ / 2, cy = _CANVAS_SZ / 2;
+  const col = _orbState === "user" ? "rgba(80,160,255," : _orbState === "llm" ? "rgba(240,140,40," : "rgba(220,110,20,";
+  const minR = _ORB_R + 8;
+  const maxR = _orbState === "idle" ? _ORB_R + 24 : _ORB_R + 40;
+  for (const p of _orbParticles) {{
+    p.angle += p.speed;
+    p.radius += p.drift;
+    if (p.radius < minR) p.radius = minR;
+    if (p.radius > maxR) p.radius = maxR;
+    const x = cx + Math.cos(p.angle) * p.radius;
+    const y = cy + Math.sin(p.angle) * p.radius;
+    orbCtx.beginPath();
+    orbCtx.arc(x, y, p.size, 0, Math.PI * 2);
+    orbCtx.fillStyle = col + p.opacity + ")";
+    orbCtx.fill();
+  }}
+  _orbAnimFrame = requestAnimationFrame(_orbDraw);
+}}
+
+function _startParticles(state) {{
+  const changed = _orbState !== state;
+  _orbState = state;
+  if (!_orbParticles.length) {{
+    _spawnParticles(state);
+  }} else if (changed) {{
+    const idle = state === "idle";
+    for (const p of _orbParticles) {{
+      p.speed = (idle ? 0.004 + Math.random() * 0.006 : 0.011 + Math.random() * 0.022) * (p.speed < 0 ? -1 : 1);
+      p.drift = (Math.random() - 0.5) * (idle ? 0.001 : 0.005);
+      p.size  = idle ? 1.0 + Math.random() * 1.4 : 1.4 + Math.random() * 2.4;
+      p.opacity = idle ? 0.15 + Math.random() * 0.22 : 0.35 + Math.random() * 0.55;
+    }}
+    if (!idle) {{
+      while (_orbParticles.length < 32) _orbParticles.push(_makeParticle(state));
+    }}
+  }}
+  if (!_orbAnimFrame) _orbDraw();
+}}
+
+function _stopParticles() {{
+  _orbState = "idle";
+  if (_orbAnimFrame) {{ cancelAnimationFrame(_orbAnimFrame); _orbAnimFrame = null; }}
+  orbCtx.clearRect(0, 0, _CANVAS_SZ, _CANVAS_SZ);
+  _orbParticles = [];
+}}
+
+// Orb always visible — start idle particles immediately on load
+_startParticles("idle");
+
+let _isTTSPlaying = false;
+player.addEventListener("play",  () => {{ waveform.classList.add("speaking"); _isTTSPlaying = true; voiceOrb.classList.remove("user-speaking"); voiceOrb.classList.add("llm-speaking"); _startParticles("llm"); }});
+player.addEventListener("ended", () => {{ waveform.classList.remove("speaking"); _isTTSPlaying = false; voiceOrb.classList.remove("llm-speaking"); _startParticles("idle"); _processQueuedSpeech(); }});
+player.addEventListener("pause", () => {{ waveform.classList.remove("speaking"); _isTTSPlaying = false; voiceOrb.classList.remove("llm-speaking"); _startParticles("idle"); }});
 
 function playUrl(url) {{
   player.pause();
@@ -2149,6 +2416,165 @@ function playUrl(url) {{
   player.currentTime = 0;
   player.play().catch(()=>{{}});
 }}
+
+// ---- Voice Input (Mic) — VAD mode ----
+const micBtn = document.getElementById("micBtn");
+let _voiceModeOn  = false;
+let _audioCtx     = null, _mediaStream = null, _scriptProc = null, _analyser = null;
+let _micChunks    = [], _isSpeechActive = false;
+let _speechStartTime = null, _silenceStartTime = null;
+let _vadInterval  = null, _queuedChunks = null;
+
+const SILENCE_THRESHOLD = 0.025;  // RMS below this = silence
+const SILENCE_SEND_MS   = 1200;   // ms of silence before auto-send
+const MIN_SPEECH_MS     = 400;    // minimum speech duration to bother sending
+
+function _statusReset() {{
+  statusEl.textContent = _voiceModeOn ? "Listening..." : "";
+}}
+
+function _encodeWAV(samples, sampleRate) {{
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const ws = (o, s) => {{ for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); }};
+  ws(0,"RIFF"); v.setUint32(4, 36 + samples.length * 2, true);
+  ws(8,"WAVE"); ws(12,"fmt ");
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,sampleRate,true); v.setUint32(28,sampleRate*2,true);
+  v.setUint16(32,2,true); v.setUint16(34,16,true);
+  ws(36,"data"); v.setUint32(40,samples.length*2,true);
+  let o = 44;
+  for (let i = 0; i < samples.length; i++) {{
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true); o += 2;
+  }}
+  return new Blob([buf], {{ type: "audio/wav" }});
+}}
+
+function _getRMS() {{
+  if (!_analyser) return 0;
+  const data = new Uint8Array(_analyser.fftSize);
+  _analyser.getByteTimeDomainData(data);
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {{ const v = (data[i] - 128) / 128; sum += v * v; }}
+  return Math.sqrt(sum / data.length);
+}}
+
+async function _transcribeAndSend(chunks) {{
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  if (!total) return;
+  const pcm = new Float32Array(total);
+  let off = 0;
+  for (const c of chunks) {{ pcm.set(c, off); off += c.length; }}
+  statusEl.textContent = "Transcribing...";
+  try {{
+    const fd = new FormData();
+    fd.append("audio", _encodeWAV(pcm, 16000), "recording.wav");
+    const r = await fetch("/api/stt", {{ method: "POST", body: fd }});
+    const d = await r.json();
+    if (d.text && d.text.trim()) {{
+      msgEl.value = d.text;
+      await doSend();
+    }} else {{
+      _statusReset();
+    }}
+  }} catch(e) {{
+    statusEl.textContent = "STT error: " + e.message;
+    setTimeout(_statusReset, 2500);
+  }}
+}}
+
+async function _processQueuedSpeech() {{
+  if (!_queuedChunks || !_voiceModeOn) return;
+  const chunks = _queuedChunks;
+  _queuedChunks = null;
+  await _transcribeAndSend(chunks);
+}}
+
+function _vadTick() {{
+  const rms = _getRMS();
+  const now = Date.now();
+  if (rms > SILENCE_THRESHOLD) {{
+    _silenceStartTime = null;
+    if (!_isSpeechActive) {{
+      _isSpeechActive = true;
+      _speechStartTime = now;
+      _micChunks = [];
+      voiceOrb.classList.add("user-speaking");
+      _startParticles("user");
+    }}
+  }} else if (_isSpeechActive) {{
+    if (!_silenceStartTime) _silenceStartTime = now;
+    const silenced  = now - _silenceStartTime;
+    const speechDur = (_silenceStartTime || now) - (_speechStartTime || now);
+    if (silenced >= SILENCE_SEND_MS && speechDur >= MIN_SPEECH_MS) {{
+      _isSpeechActive = false;
+      voiceOrb.classList.remove("user-speaking");
+      _startParticles("idle");
+      const chunks = [..._micChunks];
+      _micChunks = [];
+      _silenceStartTime = null;
+      _speechStartTime  = null;
+      if (_isTTSPlaying) {{
+        _queuedChunks = chunks;
+        statusEl.textContent = "Queued — waiting for playback to finish...";
+      }} else {{
+        _transcribeAndSend(chunks);
+      }}
+    }}
+  }}
+}}
+
+async function _enableVoiceMode() {{
+  _audioCtx    = new AudioContext({{ sampleRate: 16000 }});
+  _mediaStream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
+  const source = _audioCtx.createMediaStreamSource(_mediaStream);
+  _analyser    = _audioCtx.createAnalyser();
+  _analyser.fftSize = 2048;
+  _scriptProc  = _audioCtx.createScriptProcessor(4096, 1, 1);
+  _micChunks   = [];
+  _scriptProc.onaudioprocess = (e) => {{
+    if (_isSpeechActive) _micChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  }};
+  source.connect(_analyser);
+  source.connect(_scriptProc);
+  _scriptProc.connect(_audioCtx.destination);
+  _isSpeechActive = false; _speechStartTime = null; _silenceStartTime = null;
+  _vadInterval = setInterval(_vadTick, 80);
+  micBtn.classList.add("recording");
+  micBtn.title = "Voice mode ON — click to disable";
+  statusEl.textContent = "Listening...";
+  _startParticles("idle");
+}}
+
+function _disableVoiceMode() {{
+  if (_vadInterval)  {{ clearInterval(_vadInterval); _vadInterval = null; }}
+  if (_scriptProc)   {{ _scriptProc.disconnect(); _scriptProc = null; }}
+  if (_mediaStream)  {{ _mediaStream.getTracks().forEach(t => t.stop()); _mediaStream = null; }}
+  if (_audioCtx)     {{ _audioCtx.close(); _audioCtx = null; }}
+  _analyser = null; _micChunks = []; _isSpeechActive = false; _queuedChunks = null;
+  micBtn.classList.remove("recording");
+  micBtn.title = "Toggle voice input";
+  statusEl.textContent = "";
+  voiceOrb.classList.remove("user-speaking", "llm-speaking");
+  _startParticles("idle");
+}}
+
+micBtn.addEventListener("click", async () => {{
+  if (_voiceModeOn) {{
+    _voiceModeOn = false;
+    _disableVoiceMode();
+  }} else {{
+    try {{
+      _voiceModeOn = true;
+      await _enableVoiceMode();
+    }} catch(e) {{
+      _voiceModeOn = false;
+      statusEl.textContent = "Mic error: " + e.message;
+      setTimeout(() => statusEl.textContent = "", 3000);
+    }}
+  }}
+}});
 
 const TOOL_ICONS = {{
   list_dir:"📂", read_file:"📖", write_file:"✏️", run_external_process:"⚡",
@@ -2390,7 +2816,7 @@ async function doSend() {{
 
     if (data.approval_required) {{
       addApprovalBubble(data.approval);
-      statusEl.textContent = "";
+      _statusReset();
       await refreshSessions();
       return;
     }}
@@ -2400,8 +2826,13 @@ async function doSend() {{
     if (data.audio_url) {{
       statusEl.textContent = "Voicing...";
       playUrl(data.audio_url);
+      // orb handled by player play/ended events
+    }} else {{
+      voiceOrb.classList.add("llm-speaking");
+      _startParticles("llm");
+      setTimeout(() => {{ voiceOrb.classList.remove("llm-speaking"); _startParticles("idle"); }}, 2000);
     }}
-    statusEl.textContent = "";
+    _statusReset();
     await refreshSessions();
   }} catch (e) {{
     statusEl.textContent = "Error: " + e.message;

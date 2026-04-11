@@ -6,6 +6,18 @@
 
 A locally-running AI voice agent with an agentic tool loop, sandboxed filesystem access, and a clean browser UI. All inference runs on-device via Ollama — no cloud APIs, no subscriptions.
 
+## Screenshots
+
+<p align="center">
+  <img src="data/ref/Screenshot 2026-04-11 104311.png" alt="Aegis AI chat UI with animated voice orb" width="700"/>
+</p>
+<p align="center"><em>Chat UI — animated voice orb in sidebar, Auto Voice toggle, Kokoro TTS speaks every reply</em></p>
+
+<p align="center">
+  <img src="data/ref/Screenshot 2026-04-11 111029.png" alt="Agentic tool loop with approval prompt" width="700"/>
+</p>
+<p align="center"><em>Agentic tool loop — collapsible tool timeline and risky-tool approval gate (Deny / Approve)</em></p>
+
 ## Features
 
 - **Voice I/O** — Kokoro TTS (neural, on-device) speaks every reply. Auto Voice toggles it on/off per session.
