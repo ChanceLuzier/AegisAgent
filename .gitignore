@@ -1,0 +1,30 @@
+# Runtime data — never commit
+sessions/
+tmp/
+*.webm
+*.wav
+*.mp3
+*.ogg
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE / local config
+.claude/
+.vscode/
+.idea/
+*.local.json
+
+# OS
+.DS_Store
+Thumbs.db

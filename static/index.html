@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Local AI Director (Voice Chat)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; max-width: 900px; }
+    button { padding: 10px 14px; margin-right: 8px; }
+    #log { white-space: pre-wrap; background: #111; color: #ddd; padding: 12px; border-radius: 8px; min-height: 220px; }
+    .row { margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h2>Local AI Director — Voice Chat</h2>
+
+  <div class="row">
+    <button id="btnStart">🎤 Start Recording</button>
+    <button id="btnStop" disabled>⏹ Stop & Send</button>
+  </div>
+
+  <div class="row">
+    <audio id="player" controls></audio>
+  </div>
+
+  <div class="row" id="log"></div>
+
+<script>
+let mediaRecorder;
+let chunks = [];
+
+const log = (msg) => {
+  const el = document.getElementById("log");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+};
+
+async function startRecording() {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  chunks = [];
+  mediaRecorder = new MediaRecorder(stream);
+  mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
+  mediaRecorder.onstop = () => stream.getTracks().forEach(t => t.stop());
+  mediaRecorder.start();
+  log("Recording...");
+  document.getElementById("btnStart").disabled = true;
+  document.getElementById("btnStop").disabled = false;
+}
+
+async function stopAndSend() {
+  if (!mediaRecorder) return;
+  mediaRecorder.stop();
+
+  document.getElementById("btnStop").disabled = true;
+  log("Uploading...");
+
+  const blob = new Blob(chunks, { type: "audio/webm" });
+  const form = new FormData();
+  form.append("audio", blob, "mic.webm");
+
+  const res = await fetch("/api/voice_chat", { method: "POST", body: form });
+  const data = await res.json();
+
+  if (!res.ok) {
+    log("ERROR: " + (data.error || "unknown"));
+    document.getElementById("btnStart").disabled = false;
+    return;
+  }
+
+  log("You: " + data.user_text);
+  log("AI: " + data.assistant_text);
+
+  const player = document.getElementById("player");
+  player.src = data.audio_url + "?t=" + Date.now();
+  await player.play();
+
+  document.getElementById("btnStart").disabled = false;
+}
+
+document.getElementById("btnStart").onclick = startRecording;
+document.getElementById("btnStop").onclick = stopAndSend;
+</script>
+</body>
+</html>
