@@ -1,0 +1,8 @@
+[
+  {"id": "list_dir_root", "tool": "list_dir", "args": {"path": "."}, "expect_key": "items", "description": "List project root directory"},
+  {"id": "read_readme", "tool": "read_file", "args": {"path": "README.md"}, "expect_key": "content", "description": "Read README.md"},
+  {"id": "scan_versions", "tool": "scan_project_versions", "args": {}, "expect_key": "results", "description": "Scan for version strings"},
+  {"id": "format_text", "tool": "format_text", "args": {"text": "hello world", "style": "upper"}, "expect_key": "result", "description": "Format text to uppercase"},
+  {"id": "search_sessions", "tool": "search_sessions", "args": {"query": "test"}, "expect_key": "results", "description": "Search session history"},
+  {"id": "get_last_scan", "tool": "get_last_version_scan", "args": {}, "expect_key": "scan", "description": "Get cached version scan"}
+]

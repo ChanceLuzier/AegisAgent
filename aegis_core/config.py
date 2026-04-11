@@ -11,22 +11,22 @@ APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # ----------------------------
 # Config / Paths
 # ----------------------------
-DIRECTOR_DIR = os.environ.get("AEGIS_DIRECTOR_DIR", r"C:\\AI\\director")
-XTTS_DIR = os.environ.get("AEGIS_XTTS_DIR", r"C:\\AI\\xtts")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-TMP_DIR = os.environ.get("AEGIS_TMP_DIR", os.path.join(DIRECTOR_DIR, "tmp"))
-SESSIONS_DIR = os.environ.get("AEGIS_SESSIONS_DIR", os.path.join(DIRECTOR_DIR, "sessions"))
-STATIC_DIR = os.environ.get("AEGIS_STATIC_DIR", os.path.join(DIRECTOR_DIR, "static"))
+DIRECTOR_DIR = os.environ.get("AEGIS_DIRECTOR_DIR", _PROJECT_ROOT)
 
-REF_WAV = os.environ.get("SPEAKER_WAV") or os.path.join(XTTS_DIR, "ref.wav")
+TMP_DIR = os.environ.get("AEGIS_TMP_DIR", os.path.join(_PROJECT_ROOT, "tmp"))
+SESSIONS_DIR = os.environ.get("AEGIS_SESSIONS_DIR", os.path.join(_PROJECT_ROOT, "sessions"))
+STATIC_DIR = os.environ.get("AEGIS_STATIC_DIR", os.path.join(_PROJECT_ROOT, "static"))
 
 OLLAMA_CHAT_URL = os.environ.get("OLLAMA_CHAT_URL", "http://127.0.0.1:11434/api/chat")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:8b")
 
 # Voice
 VOICE_SR = int(os.environ.get("VOICE_SR", "24000"))
-XTTS_GPU = os.environ.get("XTTS_GPU", "0").strip().lower() in ("1", "true", "yes")
-XTTS_PREWARM = os.environ.get("XTTS_PREWARM", "0").strip().lower() in ("1", "true", "yes")
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "af_heart")
+KOKORO_GPU = os.environ.get("KOKORO_GPU", "0").strip().lower() in ("1", "true", "yes")
+KOKORO_PREWARM = os.environ.get("KOKORO_PREWARM", "0").strip().lower() in ("1", "true", "yes")
 
 # UI and cleanup
 UI_MAX_BUBBLES = int(os.environ.get("UI_MAX_BUBBLES", "300"))

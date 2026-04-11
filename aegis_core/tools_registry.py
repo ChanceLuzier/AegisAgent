@@ -141,6 +141,17 @@ def build_tools_registry(
     }
 
 
+def get_mcp_tools(tools: Dict) -> List[Dict]:
+    return [
+        {
+            "name": t.name,
+            "description": t.description,
+            "inputSchema": t.schema,
+        }
+        for t in tools.values()
+    ]
+
+
 def build_system_tool_instructions(app_name: str, allowed_roots: List[str], tools: Dict[str, ToolDef]) -> str:
     """Keep the exact SYSTEM_TOOL_INSTRUCTIONS string previously built inline in app.py."""
     return (

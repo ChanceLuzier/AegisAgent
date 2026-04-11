@@ -19,6 +19,9 @@ build/
 venv/
 env/
 
+# Local environment
+.env
+
 # IDE / local config
 .claude/
 .vscode/

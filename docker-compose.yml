@@ -1,0 +1,53 @@
+services:
+
+  # ── Aegis AI Assistant ──────────────────────────────────────────────────────
+  aegis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aegis
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      OLLAMA_CHAT_URL: http://ollama:11434/api/chat
+      AEGIS_MODE: ${AEGIS_MODE:-semi}
+      KOKORO_VOICE: ${KOKORO_VOICE:-af_heart}
+      AGENT_MAX_ITERS: ${AGENT_MAX_ITERS:-5}
+    volumes:
+      # Persist conversation sessions across container restarts
+      - ./sessions:/app/sessions
+      # Cache HuggingFace / Kokoro TTS models so they are not re-downloaded
+      - huggingface_cache:/cache/huggingface
+    depends_on:
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── Ollama LLM Server ───────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      # Persist downloaded Ollama models
+      - ollama_models:/root/.ollama
+    # CPU-only by default; to enable GPU support uncomment the section below
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  huggingface_cache:
+  ollama_models:

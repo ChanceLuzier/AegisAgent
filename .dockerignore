@@ -1,0 +1,46 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Runtime-generated directories (recreated by the app)
+tmp/
+sessions/
+
+# Secrets / local config
+.env
+.env.*
+
+# Audio output files
+*.wav
+*.webm
+*.mp3
+*.ogg
+
+# Dataset / model data
+data/
+
+# Docker files (not needed inside the image)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Editor / OS artifacts
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

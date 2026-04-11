@@ -3,7 +3,7 @@ Aegis AI — v1.1.7 (Modular Core)
 Semi-Autonomous Local Assistant Core (Windows, GPU, Local-first)
 
 Run:
-  C:\\AI\\xtts\\.venv\\Scripts\\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000
+  .venv\\Scripts\\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8000
 
 UI:
   http://127.0.0.1:8000/ui
@@ -33,6 +33,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Callable, Tuple
 
+import numpy as np
 import requests
 from fastapi import FastAPI, Body
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -43,16 +44,15 @@ from aegis_core.config import (
     APP_VERSION,
     APP_TITLE,
     DIRECTOR_DIR,
-    XTTS_DIR,
     TMP_DIR,
     SESSIONS_DIR,
     STATIC_DIR,
-    REF_WAV,
     OLLAMA_CHAT_URL,
     OLLAMA_MODEL,
     VOICE_SR,
-    XTTS_GPU,
-    XTTS_PREWARM,
+    KOKORO_VOICE,
+    KOKORO_GPU,
+    KOKORO_PREWARM,
     UI_MAX_BUBBLES,
     TMP_MAX_FILES,
     TMP_MAX_AGE_SEC,
@@ -97,6 +97,7 @@ _last_error: str = ""
 
 _tts = None
 _tts_ready = False
+_active_voice: str = KOKORO_VOICE
 
 _app_ready = False
 _app_ready_detail = "Starting..."
@@ -264,7 +265,6 @@ def _ollama_chat_retry(messages: List[Dict[str, str]]) -> str:
     return (_ollama_chat(messages) or "").strip()
 
 def _write_wav(path: str, audio: Any, sr: int) -> None:
-    import numpy as np
     arr = np.asarray(audio, dtype=np.float32).reshape(-1)
     arr = np.clip(arr, -1.0, 1.0)
     pcm16 = (arr * 32767.0).astype(np.int16).tobytes()
@@ -278,17 +278,14 @@ def _init_tts() -> None:
     global _tts, _tts_ready
     if _tts_ready:
         return
-    from TTS.api import TTS
-    _tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2")
-    if XTTS_GPU:
-        try:
-            _tts.to("cuda")
-        except Exception:
-            pass
+    from kokoro import KPipeline
+    device = "cuda" if KOKORO_GPU else "cpu"
+    _tts = KPipeline(lang_code="a", device=device)
     _tts_ready = True
-    if XTTS_PREWARM:
+    if KOKORO_PREWARM:
         try:
-            _tts.tts(text="Warmup.", speaker_wav=REF_WAV, language="en")
+            for _ in _tts("Warmup.", voice=_active_voice, speed=1.0):
+                pass
         except Exception:
             pass
 
@@ -299,7 +296,8 @@ def _synthesize_full(text: str) -> str:
     _init_tts()
     filename = _safe_filename("voice", "wav")
     out_path = os.path.join(TMP_DIR, filename)
-    audio = _tts.tts(text=text, speaker_wav=REF_WAV, language="en")
+    chunks = [audio for _, _, audio in _tts(text, voice=_active_voice, speed=1.0)]
+    audio = np.concatenate(chunks)
     _write_wav(out_path, audio, VOICE_SR)
     return f"/tmp_audio/{filename}"
 def _truncate(s: str, n: int) -> str:
@@ -316,7 +314,7 @@ def _truncate(s: str, n: int) -> str:
 # Tool Registry
 # ----------------------------
 from aegis_core.tools import ToolDef, ToolLevel
-from aegis_core.tools_registry import build_system_tool_instructions, build_tools_registry
+from aegis_core.tools_registry import build_system_tool_instructions, build_tools_registry, get_mcp_tools
 
 def _tool_level(name: str) -> ToolLevel:
     from aegis_core.tools import tool_level
@@ -790,6 +788,7 @@ def _agent_run(session_id: str, auto_voice: bool) -> Dict[str, Any]:
     executed_any_tool = False
     last_tool_name = ""
     last_tool_result: Optional[Dict[str, Any]] = None
+    tool_log: List[Dict[str, Any]] = []
 
     while iters < AGENT_MAX_ITERS:
         iters += 1
@@ -827,6 +826,11 @@ def _agent_run(session_id: str, auto_voice: bool) -> Dict[str, Any]:
             last_tool_name = tool_name
             result = _execute_tool(tool_name, args)
             last_tool_result = result
+            tool_log.append({
+                "tool": tool_name,
+                "status": "ok" if result.get("ok") is not False else "error",
+                "args_preview": ", ".join(f"{k}={str(v)[:50]}" for k, v in list((args or {}).items())[:3]),
+            })
 
             # If propose_patch returns proposed_approval -> create approval for apply_patch immediately
             if tool_name == "propose_patch" and isinstance(result, dict) and result.get("ok") and isinstance(result.get("proposed_approval"), dict):
@@ -914,7 +918,7 @@ def _agent_run(session_id: str, auto_voice: bool) -> Dict[str, Any]:
     if auto_voice and last_assistant_text.strip():
         audio_url = _synthesize_full(last_assistant_text)
 
-    return {"reply": last_assistant_text, "audio_url": audio_url, "auto_voice": auto_voice, "approval_required": False}
+    return {"reply": last_assistant_text, "audio_url": audio_url, "auto_voice": auto_voice, "approval_required": False, "tool_log": tool_log}
 
 def _agent_continue_after_approval(approval_id: str, approved: bool) -> Dict[str, Any]:
     pending = PENDING_APPROVALS.get(approval_id)
@@ -1021,12 +1025,12 @@ def _warmup_worker() -> None:
         _ensure_dirs()
         _app_ready_detail = "Cleaning temp audio..."
         _cleanup_tmp()
-        if XTTS_PREWARM:
-            _app_ready_detail = "Loading XTTS..."
+        if KOKORO_PREWARM:
+            _app_ready_detail = "Loading Kokoro..."
             _init_tts()
             _app_ready_detail = "Warming voice model..."
         else:
-            _app_ready_detail = "Skipping XTTS prewarm (XTTS_PREWARM=0)"
+            _app_ready_detail = "Skipping Kokoro prewarm (KOKORO_PREWARM=0)"
         _app_ready_detail = "Ready"
         _app_ready = True
     except Exception as e:
@@ -1067,10 +1071,9 @@ def health() -> Dict[str, Any]:
         "ready": _app_ready,
         "ready_detail": _app_ready_detail,
         "tts_loaded": bool(_tts_ready),
-        "xtts_gpu_env": XTTS_GPU,
-        "xtts_prewarm_env": XTTS_PREWARM,
-        "speaker_wav": REF_WAV,
-        "speaker_wav_exists": os.path.exists(REF_WAV),
+        "kokoro_voice": KOKORO_VOICE,
+        "kokoro_gpu_env": KOKORO_GPU,
+        "kokoro_prewarm_env": KOKORO_PREWARM,
         "ollama_url": OLLAMA_CHAT_URL,
         "ollama_model": OLLAMA_MODEL,
         "tmp_dir": TMP_DIR,
@@ -1302,6 +1305,48 @@ def api_tts(payload: Dict[str, Any] = Body(...)) -> Any:
         _set_last_error(e)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
+_VALID_VOICES = {
+    "af_heart": "Heart — American Female",
+    "af_bella": "Bella — American Female",
+    "am_adam":  "Adam — American Male",
+    "bf_emma":  "Emma — British Female",
+    "bm_george":"George — British Male",
+}
+
+@app.get("/api/settings", response_class=JSONResponse)
+def api_settings_get() -> Any:
+    return {
+        "voice": _active_voice,
+        "available_voices": [{"id": k, "label": v} for k, v in _VALID_VOICES.items()],
+    }
+
+@app.post("/api/settings", response_class=JSONResponse)
+def api_settings_post(payload: Dict[str, Any] = Body(...)) -> Any:
+    global _active_voice
+    voice = str(payload.get("voice", "")).strip()
+    if voice not in _VALID_VOICES:
+        return JSONResponse(status_code=400, content={"error": f"Invalid voice: {voice}"})
+    _active_voice = voice
+    return {"ok": True, "voice": _active_voice}
+
+@app.get("/api/tools/mcp", response_class=JSONResponse)
+def api_tools_mcp() -> Any:
+    """Return tool schemas in Model Context Protocol (MCP) format."""
+    return {"tools": get_mcp_tools(TOOLS)}
+
+@app.post("/api/eval", response_class=JSONResponse)
+def api_eval() -> Any:
+    """Run the eval harness and return scored results."""
+    if not _app_ready:
+        return JSONResponse(status_code=503, content={"error": "Server not ready"})
+    try:
+        from evals.runner import run_evals
+        results = run_evals(TOOLS, SESSIONS_DIR)
+        return results
+    except Exception as e:
+        _set_last_error(e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 @app.get("/api/last_assistant", response_class=JSONResponse)
 def api_last_assistant(session_id: str) -> Any:
     try:
@@ -1326,6 +1371,7 @@ def ui() -> str:
 <head>
   <meta charset="utf-8" />
   <title>{APP_TITLE}</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231f6feb'/%3E%3Ctext x='16' y='23' font-family='system-ui' font-size='20' font-weight='800' text-anchor='middle' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
   <style>
     :root {{
       --bg: #0b0f14;
@@ -1368,6 +1414,64 @@ def ui() -> str:
       flex-direction: column;
       min-width: 220px;
       overflow: hidden;
+      position: relative;
+    }}
+    .sidebarFooter {{
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      flex-shrink: 0;
+    }}
+    .cogBtn {{
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.10);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 16px;
+      transition: background 120ms ease, transform 200ms ease;
+    }}
+    .cogBtn:hover {{ background: rgba(255,255,255,0.12); transform: rotate(30deg); }}
+    .settingsPanel {{
+      position: absolute;
+      bottom: 52px;
+      left: 10px;
+      right: 10px;
+      background: #1f242b;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+      display: none;
+      flex-direction: column;
+      gap: 12px;
+      z-index: 100;
+    }}
+    .settingsPanel.show {{ display: flex; }}
+    .settingsPanel .settingsLabel {{
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 4px;
+      display: block;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }}
+    .settingsPanel select {{
+      width: 100%;
+      background: var(--field);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+      box-sizing: border-box;
+      font-size: 13px;
+      cursor: pointer;
     }}
     .resizer {{
       cursor: col-resize;
@@ -1571,7 +1675,7 @@ def ui() -> str:
       padding: 10px;
       box-sizing: border-box;
     }}
-    audio {{ width: 100%; margin-top: 8px; }}
+    audio {{ display: none; }}
     .overlay {{
       position: fixed;
       inset: 0;
@@ -1631,6 +1735,77 @@ def ui() -> str:
       transition: left 120ms ease;
     }}
     .switch.on .knob {{ left: 23px; }}
+
+    /* Waveform speaking indicator */
+    .waveform {{
+      display: none;
+      align-items: flex-end;
+      gap: 2px;
+      height: 18px;
+    }}
+    .waveform.speaking {{ display: flex; }}
+    .waveform span {{
+      width: 3px;
+      border-radius: 2px;
+      background: rgba(31,111,235,0.85);
+      height: 4px;
+      animation: wavebar 0.9s ease-in-out infinite;
+    }}
+    .waveform span:nth-child(1) {{ animation-delay: 0.00s; }}
+    .waveform span:nth-child(2) {{ animation-delay: 0.15s; }}
+    .waveform span:nth-child(3) {{ animation-delay: 0.30s; }}
+    .waveform span:nth-child(4) {{ animation-delay: 0.45s; }}
+    .waveform span:nth-child(5) {{ animation-delay: 0.60s; }}
+    @keyframes wavebar {{
+      0%, 100% {{ height: 4px; opacity: 0.5; }}
+      50% {{ height: 16px; opacity: 1; }}
+    }}
+
+    /* Tool call timeline */
+    .toolTimeline {{
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-bottom: 4px;
+    }}
+    .toolCard {{
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      font-size: 12px;
+      background: rgba(0,0,0,0.18);
+    }}
+    .toolCardHeader {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 10px;
+      cursor: pointer;
+      user-select: none;
+    }}
+    .toolCardHeader:hover {{ background: rgba(255,255,255,0.04); }}
+    .toolName {{ font-weight: 600; font-family: monospace; }}
+    .toolArgs {{ color: var(--muted); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .toolBadge {{
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }}
+    .toolBadge.ok {{ background: rgba(35,134,54,0.3); color: #3fb950; }}
+    .toolBadge.error {{ background: rgba(248,81,73,0.2); color: #f85149; }}
+    .toolCardChevron {{ font-size: 10px; color: var(--muted); margin-left: 2px; transition: transform 120ms; }}
+    .toolCard.open .toolCardChevron {{ transform: rotate(90deg); }}
+    .toolCardBody {{
+      padding: 6px 10px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-family: monospace;
+      font-size: 11px;
+      display: none;
+    }}
+    .toolCard.open .toolCardBody {{ display: block; }}
   </style>
 </head>
 <body>
@@ -1659,6 +1834,21 @@ def ui() -> str:
       <div class="hint">Tip: Right-click a session to rename • Click 🔥 to burn (delete)</div>
     </div>
     <div class="sessions" id="sessions"></div>
+    <div class="settingsPanel" id="settingsPanel">
+      <div>
+        <span class="settingsLabel">Voice</span>
+        <select id="voiceSelect">
+          <option value="af_heart">Heart — American Female</option>
+          <option value="af_bella">Bella — American Female</option>
+          <option value="am_adam">Adam — American Male</option>
+          <option value="bf_emma">Emma — British Female</option>
+          <option value="bm_george">George — British Male</option>
+        </select>
+      </div>
+    </div>
+    <div class="sidebarFooter">
+      <button class="cogBtn" id="cogBtn" title="Settings">⚙</button>
+    </div>
   </div>
 
   <div class="resizer" id="resizer"></div>
@@ -1676,6 +1866,9 @@ def ui() -> str:
         <span class="small" id="autoVoiceLabel"></span>
       </div>
 
+      <div class="waveform" id="waveform">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
       <span class="sessionTitle" id="sessionTitle"></span>
       <span class="small" id="status"></span>
     </div>
@@ -1690,7 +1883,7 @@ def ui() -> str:
         <button class="secondary" id="voiceLast">Voice Last</button>
         <button id="send">Send</button>
       </div>
-      <audio id="player" controls></audio>
+      <audio id="player"></audio>
     </div>
   </div>
 </div>
@@ -1788,6 +1981,38 @@ function renderAutoVoice() {{
 }}
 autoVoiceSwitch.addEventListener("click", () => setAutoVoice(!getAutoVoice()));
 renderAutoVoice();
+
+// Settings panel
+const cogBtn = document.getElementById("cogBtn");
+const settingsPanel = document.getElementById("settingsPanel");
+const voiceSelect = document.getElementById("voiceSelect");
+
+cogBtn.addEventListener("click", (e) => {{
+  e.stopPropagation();
+  settingsPanel.classList.toggle("show");
+}});
+document.addEventListener("click", () => settingsPanel.classList.remove("show"));
+settingsPanel.addEventListener("click", (e) => e.stopPropagation());
+
+async function loadSettings() {{
+  try {{
+    const r = await fetch("/api/settings");
+    const d = await r.json();
+    voiceSelect.value = d.voice;
+  }} catch {{}}
+}}
+
+voiceSelect.addEventListener("change", async () => {{
+  try {{
+    await fetch("/api/settings", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{voice: voiceSelect.value}})
+    }});
+  }} catch {{}}
+}});
+
+loadSettings();
 
 let sessionId = localStorage.getItem("director_session_id");
 if (!sessionId) {{
@@ -1913,11 +2138,52 @@ function clearChat() {{
   chatEl.innerHTML = "";
 }}
 
+const waveform = document.getElementById("waveform");
+player.addEventListener("play",  () => waveform.classList.add("speaking"));
+player.addEventListener("ended", () => waveform.classList.remove("speaking"));
+player.addEventListener("pause", () => waveform.classList.remove("speaking"));
+
 function playUrl(url) {{
   player.pause();
   player.src = url;
   player.currentTime = 0;
   player.play().catch(()=>{{}});
+}}
+
+const TOOL_ICONS = {{
+  list_dir:"📂", read_file:"📖", write_file:"✏️", run_external_process:"⚡",
+  apply_patch:"🩹", propose_patch:"🔍", search_sessions:"🔎",
+  scan_project_versions:"🔬", format_text:"📝", summarize_session:"📋",
+  rename_session:"🏷️", burn_session:"🔥", get_last_version_scan:"📊",
+}};
+
+function addToolTimeline(toolLog) {{
+  if (!toolLog || !toolLog.length) return;
+  const timeline = document.createElement("div");
+  timeline.className = "toolTimeline";
+  for (const entry of toolLog) {{
+    const card = document.createElement("div");
+    card.className = "toolCard";
+    const header = document.createElement("div");
+    header.className = "toolCardHeader";
+    const icon = TOOL_ICONS[entry.tool] || "🔧";
+    header.innerHTML =
+      `<span>${{icon}}</span>` +
+      `<span class="toolName">${{entry.tool}}</span>` +
+      `<span class="toolArgs">${{entry.args_preview || ""}}</span>` +
+      `<span class="toolBadge ${{entry.status}}">${{entry.status}}</span>` +
+      `<span class="toolCardChevron">▶</span>`;
+    const body = document.createElement("div");
+    body.className = "toolCardBody";
+    body.textContent = entry.args_preview || "(no args)";
+    header.addEventListener("click", () => card.classList.toggle("open"));
+    card.appendChild(header);
+    card.appendChild(body);
+    timeline.appendChild(card);
+  }}
+  chatEl.appendChild(timeline);
+  while (chatEl.children.length > UI_MAX_BUBBLES) chatEl.removeChild(chatEl.firstChild);
+  scrollToBottomIfNeeded();
 }}
 
 async function apiGet(url) {{
@@ -2129,6 +2395,7 @@ async function doSend() {{
       return;
     }}
 
+    addToolTimeline(data.tool_log);
     addBubble("assistant", data.reply || "");
     if (data.audio_url) {{
       statusEl.textContent = "Voicing...";

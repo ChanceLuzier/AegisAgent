@@ -1,16 +1,22 @@
 # Aegis AI — Local Voice Agent
 
-![Status](https://img.shields.io/badge/status-active%20development-yellow)
+![Status](https://img.shields.io/badge/status-active%20development-blue)
+![Python](https://img.shields.io/badge/python-3.12-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-A locally-running AI agent with voice I/O, an agentic tool loop, and a sandboxed filesystem. All inference runs on-device via Ollama — no cloud APIs required.
+A locally-running AI voice agent with an agentic tool loop, sandboxed filesystem access, and a clean browser UI. All inference runs on-device via Ollama — no cloud APIs, no subscriptions.
 
-## What it does
+## Features
 
-- **Voice in / voice out** — records mic input, transcribes with Whisper, responds with XTTS text-to-speech
-- **Agentic loop** — the LLM can call tools (read/write files, run shell commands, propose patches, search sessions) up to a configurable iteration limit
-- **Session management** — persistent named conversation sessions with search and summarization tools
-- **Guardrails** — filesystem access is sandboxed to configurable allowed roots; read/write byte limits and process timeouts are enforced
-- **Web UI** — minimal browser interface served by FastAPI
+- **Voice I/O** — Kokoro TTS (neural, on-device) speaks every reply. Auto Voice toggles it on/off per session.
+- **Agentic loop** — the LLM calls tools (read/write files, run shell commands, propose/apply patches, search sessions) up to a configurable iteration limit
+- **Tool call timeline** — each tool invocation renders as a collapsible card in the chat so you can see exactly what the agent did
+- **Session management** — persistent named sessions with search, rename, and burn (delete)
+- **Settings panel** — cog icon in the sidebar lets you switch voices live (no restart needed)
+- **Guardrails** — filesystem access sandboxed to configurable roots; byte limits and process timeouts enforced
+- **MCP-compatible tool schema** — `GET /api/tools/mcp` exports all tools in Model Context Protocol format, compatible with Claude, Cursor, and other MCP hosts
+- **Eval harness** — `POST /api/eval` runs a built-in benchmark suite and scores the tool layer
+- **Docker support** — one-command deploy with Ollama as a sidecar
 
 ## Stack
 
@@ -18,59 +24,96 @@ A locally-running AI agent with voice I/O, an agentic tool loop, and a sandboxed
 |---|---|
 | API server | FastAPI + Uvicorn |
 | LLM backend | Ollama (default: `llama3.1:8b`) |
-| Text-to-speech | Coqui XTTS v2 |
-| Speech-to-text | Whisper (via Ollama or local) |
+| Text-to-speech | Kokoro TTS (Apache 2.0, fully local) |
+| Python | 3.12+ |
 
-## Setup
+## Quick Start
 
-```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+```powershell
+# Clone and enter the project
+git clone <repo-url>
+cd AegisAgent
 
-# 2. Configure via environment variables (see Configuration below)
+# One-command setup (creates .venv, installs all deps)
+.\setup.ps1
 
-# 3. Start Ollama and pull the model
-ollama pull llama3.1:8b
+# Start Ollama (separate terminal)
+ollama serve
 
-# 4. Run
-uvicorn app:app --host 127.0.0.1 --port 8000
+# Run Aegis
+.\run.ps1
 
-# 5. Open http://127.0.0.1:8000/ui
+# Open http://127.0.0.1:8000/ui
+```
+
+## Docker
+
+```powershell
+docker compose up --build
+# Open http://127.0.0.1:8000/ui
+# Pull a model: docker compose exec ollama ollama pull llama3.1:8b
 ```
 
 ## Configuration
 
-All settings are environment variables with safe defaults:
+Copy `.env.example` to `.env` and adjust. All settings have safe defaults — no configuration required to run.
 
 | Variable | Default | Description |
 |---|---|---|
-| `AEGIS_DIRECTOR_DIR` | `C:\AI\director` | Working directory for sessions and static files |
-| `AEGIS_XTTS_DIR` | `C:\AI\xtts` | Path to XTTS installation |
 | `OLLAMA_CHAT_URL` | `http://127.0.0.1:11434/api/chat` | Ollama API endpoint |
 | `OLLAMA_MODEL` | `llama3.1:8b` | Model to use |
-| `AEGIS_ALLOWED_ROOTS` | `DIRECTOR_DIR` | Semicolon-separated paths the agent can access |
-| `AEGIS_MODE` | `semi` | Agent mode: `auto` or `semi` (requires approval for destructive tools) |
+| `KOKORO_VOICE` | `af_heart` | TTS voice (`af_heart`, `af_bella`, `am_adam`, `bf_emma`, `bm_george`) |
+| `KOKORO_GPU` | `0` | Set to `1` to use GPU for TTS |
+| `KOKORO_PREWARM` | `0` | Set to `1` to load TTS model at startup |
+| `AEGIS_MODE` | `semi` | `semi` = approval required for risky tools, `auto` = fully autonomous |
 | `AGENT_MAX_ITERS` | `5` | Max tool-call iterations per turn |
-| `SPEAKER_WAV` | `<xtts_dir>/ref.wav` | Reference audio for voice cloning |
+| `AEGIS_ALLOWED_ROOTS` | project root | Semicolon-separated paths the agent can access |
+
+## API
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/ui` | GET | Browser interface |
+| `/api/chat` | POST | Send a message, get a reply |
+| `/api/sessions` | GET | List all sessions |
+| `/api/tools/mcp` | GET | Tool schemas in MCP format |
+| `/api/eval` | POST | Run eval harness, get scored results |
+| `/api/settings` | GET/POST | Read or update runtime settings (e.g. voice) |
+| `/health` | GET | Server health and ready state |
 
 ## Architecture
 
 ```
-app.py                  # FastAPI app, agent loop, session endpoints
+app.py                  # FastAPI app, agent loop, all endpoints
 aegis_core/
-  config.py             # All settings via os.environ
+  config.py             # Settings via environment variables
   guardrails.py         # Path sandboxing and access control
-  tools.py              # Tool definitions and permission levels
-  tools_registry.py     # Tool registry and system prompt builder
+  tools.py              # ToolDef dataclass and permission levels
+  tools_registry.py     # Tool registry, system prompt, MCP export
   scanner.py            # Project version/pattern scanner
   patch_engine.py       # Unified diff patch application
+evals/
+  tasks.json            # Benchmark task definitions
+  runner.py             # Eval harness — runs tasks, scores results
+  results.json          # Latest eval output (auto-generated)
 static/
   index.html            # Browser UI
+Dockerfile              # Container build
+docker-compose.yml      # Aegis + Ollama services
+setup.ps1               # One-command local setup
+run.ps1                 # Start the server
 ```
 
-## Planned
+## Voices
 
-- [ ] Whisper integration for local STT (currently relying on browser MediaRecorder + server-side decode)
-- [ ] Multi-model support (swap LLM backend per session)
-- [ ] Docker container for cross-platform setup
-- [ ] Tests
+Kokoro TTS voices are built-in — no reference audio needed.
+
+| Voice ID | Description |
+|---|---|
+| `af_heart` | American Female — warm (default) |
+| `af_bella` | American Female — brighter |
+| `am_adam` | American Male |
+| `bf_emma` | British Female |
+| `bm_george` | British Male |
+
+Switch voices live via the ⚙ settings panel in the sidebar, or set `KOKORO_VOICE` in `.env`.
