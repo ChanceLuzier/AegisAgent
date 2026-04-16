@@ -4,8 +4,8 @@ import re
 # ----------------------------
 # Branding
 # ----------------------------
-APP_NAME = os.environ.get("AEGIS_APP_NAME", "Aegis AI")
-APP_VERSION = os.environ.get("AEGIS_APP_VERSION", "v1.1.7")
+APP_NAME = os.environ.get("AEGIS_APP_NAME", "Aegis AI Agent")
+APP_VERSION = os.environ.get("AEGIS_APP_VERSION", "v1.2.2")
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 # ----------------------------

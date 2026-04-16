@@ -1,0 +1,10 @@
+{
+  "name": "aegis-ai",
+  "version": "1.2.2",
+  "scripts": {
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

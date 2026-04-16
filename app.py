@@ -1,5 +1,5 @@
 """
-Aegis AI — v1.1.7 (Modular Core)
+Aegis AI — v1.2.2 (Modular Core)
 Semi-Autonomous Local Assistant Core (Windows, GPU, Local-first)
 
 Run:
@@ -27,6 +27,8 @@ import time
 import uuid
 import glob
 import wave
+import atexit
+import logging
 import traceback
 import threading
 import subprocess
@@ -89,6 +91,24 @@ from aegis_core.patch_engine import (
 )
 
 # ----------------------------
+# Logging
+# ----------------------------
+_LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_log_path = os.path.join(_LOG_DIR, "aegis.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(_log_path, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("aegis")
+log.info("Aegis AI starting up — log: %s", _log_path)
+
+# ----------------------------
 # Globals
 # ----------------------------
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
@@ -122,7 +142,11 @@ _stt_ready = False
 
 _app_ready = False
 _app_ready_detail = "Starting..."
+_app_ready_progress = 0
 _warm_thread_started = False
+
+_ollama_proc: Optional[subprocess.Popen] = None  # process we launched (None = was already running)
+_ollama_we_started = False                        # True only if Aegis started it
 
 # approval_id -> dict(session_id, tool, args, reason, agent_msgs/heuristic flags, diff preview, etc.)
 PENDING_APPROVALS: Dict[str, Dict[str, Any]] = {}
@@ -272,7 +296,12 @@ def _burn_session_everything(session_id: str) -> Dict[str, Any]:
     return {"ok": True, "burned": bool(deleted), "deleted": bool(deleted), "session_id": sid, "purged_pending": purged}
 
 def _ollama_chat(messages: List[Dict[str, str]]) -> str:
-    payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": False}
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False,
+        "options": {"num_gpu": 99},  # load all layers onto GPU
+    }
     r = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=180)
     r.raise_for_status()
     data = r.json()
@@ -1096,23 +1125,138 @@ def _agent_continue_after_approval(approval_id: str, approved: bool) -> Dict[str
 # ----------------------------
 # Warmup
 # ----------------------------
+def _ollama_base_url() -> str:
+    """Derive the Ollama base URL from the configured chat endpoint."""
+    base = OLLAMA_CHAT_URL
+    for suffix in ("/api/chat", "/api/generate", "/api/tags"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base.rstrip("/")
+
+
+def _check_ollama(base_url: str, timeout: int = 2) -> bool:
+    """Return True if Ollama is reachable."""
+    try:
+        r = requests.get(f"{base_url}/api/tags", timeout=timeout)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def _start_ollama() -> None:
+    """Launch `ollama serve` and record that we own it."""
+    global _ollama_proc, _ollama_we_started
+    try:
+        env = os.environ.copy()
+        env["OLLAMA_NUM_GPU"] = "99"          # all layers on GPU
+        env["OLLAMA_FLASH_ATTENTION"] = "1"   # faster attention
+        _ollama_proc = subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        _ollama_we_started = True
+        log.info("Ollama started (pid=%s)", _ollama_proc.pid)
+    except FileNotFoundError:
+        log.warning("ollama not found on PATH — cannot auto-start")
+
+
+def _shutdown_owned_procs() -> None:
+    """Kill any processes Aegis started. Safe to call multiple times."""
+    global _ollama_proc, _ollama_we_started
+    if _ollama_we_started and _ollama_proc is not None:
+        try:
+            if _ollama_proc.poll() is None:   # still running
+                log.info("Shutting down owned Ollama process (pid=%s)", _ollama_proc.pid)
+                _ollama_proc.terminate()
+                try:
+                    _ollama_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    log.warning("Ollama did not exit cleanly — killing")
+                    _ollama_proc.kill()
+        except Exception:
+            log.exception("Error shutting down Ollama process")
+        finally:
+            _ollama_proc = None
+            _ollama_we_started = False
+
+
+atexit.register(_shutdown_owned_procs)
+
+
+def _wait_for_ollama(base_url: str, timeout_sec: int = 45) -> bool:
+    """Poll until Ollama responds or timeout expires. Returns True on success."""
+    global _app_ready_detail, _app_ready_progress
+    deadline = time.time() + timeout_sec
+    elapsed = 0
+    while time.time() < deadline:
+        if _check_ollama(base_url):
+            return True
+        elapsed = int(time.time() - (deadline - timeout_sec))
+        _app_ready_detail = f"Waiting for Ollama… ({elapsed}s)"
+        _app_ready_progress = 35 + min(20, int(elapsed / timeout_sec * 20))
+        time.sleep(0.75)
+    return False
+
+
 def _warmup_worker() -> None:
-    global _app_ready, _app_ready_detail
+    global _app_ready, _app_ready_detail, _app_ready_progress
     try:
         _app_ready = False
+        log.info("Warmup worker started")
+
         _app_ready_detail = "Creating folders..."
+        _app_ready_progress = 5
         _ensure_dirs()
+
         _app_ready_detail = "Cleaning temp audio..."
+        _app_ready_progress = 10
         _cleanup_tmp()
+
+        # --- Ollama check / auto-start ---
+        _app_ready_detail = "Checking Ollama..."
+        _app_ready_progress = 20
+        base = _ollama_base_url()
+        if _check_ollama(base):
+            log.info("Ollama already running at %s", base)
+            _app_ready_detail = "Ollama is running"
+            _app_ready_progress = 55
+        else:
+            log.info("Ollama not detected — attempting auto-start")
+            _app_ready_detail = "Ollama not detected — starting..."
+            _app_ready_progress = 30
+            _start_ollama()
+            ok = _wait_for_ollama(base)
+            if ok:
+                log.info("Ollama ready after auto-start")
+                _app_ready_detail = "Ollama started successfully"
+                _app_ready_progress = 55
+            else:
+                log.warning("Ollama did not respond within timeout — continuing anyway")
+                _app_ready_detail = "Ollama did not respond in time — continuing anyway"
+                _app_ready_progress = 55
+
+        # --- TTS prewarm ---
         if KOKORO_PREWARM:
-            _app_ready_detail = "Loading Kokoro..."
+            log.info("Prewarming Kokoro TTS")
+            _app_ready_detail = "Loading Kokoro TTS..."
+            _app_ready_progress = 65
             _init_tts()
             _app_ready_detail = "Warming voice model..."
+            _app_ready_progress = 85
         else:
+            log.info("Kokoro prewarm skipped (KOKORO_PREWARM=0)")
             _app_ready_detail = "Skipping Kokoro prewarm (KOKORO_PREWARM=0)"
+            _app_ready_progress = 90
+
+        log.info("Warmup complete — Aegis is ready")
         _app_ready_detail = "Ready"
+        _app_ready_progress = 100
         _app_ready = True
     except Exception as e:
+        log.exception("Warmup failed: %s", e)
         _set_last_error(e)
         _app_ready_detail = f"Startup error: {e}"
         _app_ready = False
@@ -1130,6 +1274,7 @@ app.mount("/tmp_audio", StaticFiles(directory=TMP_DIR), name="tmp_audio")
 def on_startup() -> None:
     global _warm_thread_started, _app_ready, _app_ready_detail
     try:
+        log.info("FastAPI startup event — launching warmup thread")
         _app_ready = False
         _app_ready_detail = "Starting warmup..."
         _ensure_dirs()
@@ -1137,9 +1282,15 @@ def on_startup() -> None:
             _warm_thread_started = True
             threading.Thread(target=_warmup_worker, daemon=True).start()
     except Exception as e:
+        log.exception("on_startup error: %s", e)
         _set_last_error(e)
         _app_ready_detail = f"Startup error: {e}"
         _app_ready = False
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    log.info("FastAPI shutdown event — cleaning up")
+    _shutdown_owned_procs()
 
 @app.get("/health", response_class=JSONResponse)
 def health() -> Dict[str, Any]:
@@ -1166,7 +1317,7 @@ def health() -> Dict[str, Any]:
 
 @app.get("/api/ready", response_class=JSONResponse)
 def api_ready() -> Any:
-    return {"ready": _app_ready, "detail": _app_ready_detail}
+    return {"ready": _app_ready, "detail": _app_ready_detail, "progress": _app_ready_progress}
 
 @app.get("/_last_error", response_class=PlainTextResponse)
 def last_error() -> str:
@@ -1484,6 +1635,10 @@ def ui() -> str:
   <meta charset="utf-8" />
   <title>{APP_TITLE}</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231f6feb'/%3E%3Ctext x='16' y='23' font-family='system-ui' font-size='20' font-weight='800' text-anchor='middle' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
   <style>
     :root {{
       --bg: #0b0f14;
@@ -1493,6 +1648,7 @@ def ui() -> str:
       --text: #e6edf3;
       --muted: rgba(230,237,243,0.75);
       --user: #1c2a3d;
+      --userBorder: #2c405c;
 
       --assistant: #4b2a12;
       --assistantBorder: #ff9a2f;
@@ -1502,31 +1658,46 @@ def ui() -> str:
       --hover: rgba(255,255,255,0.06);
       --active: rgba(31,111,235,0.18);
       --field: #1e232a;
+      --accent: #1f6feb;
 
-      --warnBg: rgba(255, 170, 0, 0.10);
-      --warnBorder: rgba(255, 170, 0, 0.35);
+      --warnBg: rgba(255,170,0,0.10);
+      --warnBorder: rgba(255,170,0,0.35);
     }}
     html, body {{
       height: 100%;
       margin: 0;
       background: var(--bg);
       color: var(--text);
-      font-family: system-ui, Arial;
+      font-family: 'Inter', system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
       overflow: hidden;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.55);
+    }}
+    ::-webkit-scrollbar {{ width: 5px; }}
+    ::-webkit-scrollbar-track {{ background: transparent; }}
+    ::-webkit-scrollbar-thumb {{
+      background: rgba(255,255,255,0.12);
+      border-radius: 4px;
+    }}
+    ::-webkit-scrollbar-thumb:hover {{
+      background: rgba(255,255,255,0.22);
     }}
     .app {{
-      height: 100%;
+      height: 100vh;
       display: grid;
       grid-template-columns: var(--sidebar-w, 320px) 8px 1fr;
+      grid-template-rows: 1fr;
     }}
     .sidebar {{
-      background: var(--panel);
+      background: #181e26;
       border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
       min-width: 220px;
       overflow: hidden;
       position: relative;
+      min-height: 0;
     }}
     .sidebarFooter {{
       padding: 8px 12px;
@@ -1591,9 +1762,17 @@ def ui() -> str:
       border-right: 1px solid var(--border);
     }}
     .resizer:hover {{ background: rgba(31,111,235,0.18); }}
+    .sidebarHeader strong {{
+      font-size: 19px;
+      font-weight: 700;
+      letter-spacing: 0.4px;
+      text-shadow:
+        0 1px 4px rgba(0,0,0,0.75),
+        0 0 14px rgba(100,150,255,0.22),
+        0 2px 0 rgba(0,0,0,0.50);
+    }}
     .sidebarHeader {{
       padding: 12px;
-      border-bottom: 1px solid var(--border);
       display: flex;
       flex-direction: column;
       gap: 8px;
@@ -1606,15 +1785,62 @@ def ui() -> str:
     }}
     .small {{ opacity: 0.8; font-size: 12px; color: var(--muted); }}
     button {{
-      background: var(--btn);
+      background: linear-gradient(180deg, rgba(255,255,255,0.13) 0%, rgba(0,0,0,0.10) 100%), var(--btn);
       color: white;
       border: 0;
       border-radius: 10px;
-      padding: 10px 12px;
+      padding: 10px 14px;
       cursor: pointer;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.2px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: transform 0.10s ease, box-shadow 0.10s ease;
+      transform: translateY(-2px);
+      box-shadow:
+        0 6px 18px rgba(0,0,0,0.40),
+        0 2px 6px rgba(0,0,0,0.28),
+        inset 0 1px 0 rgba(255,255,255,0.24),
+        inset 0 -1px 0 rgba(0,0,0,0.20);
     }}
-    button.secondary {{ background: var(--btn2); }}
-    button:disabled {{ opacity: 0.5; cursor: not-allowed; }}
+    button:hover:not(:disabled) {{
+      transform: translateY(0px);
+      box-shadow:
+        0 2px 6px rgba(0,0,0,0.30),
+        0 1px 2px rgba(0,0,0,0.22),
+        inset 0 1px 0 rgba(255,255,255,0.14),
+        inset 0 2px 4px rgba(0,0,0,0.18);
+    }}
+    button:active:not(:disabled) {{
+      transform: translateY(2px);
+      box-shadow:
+        0 1px 2px rgba(0,0,0,0.25),
+        inset 0 2px 6px rgba(0,0,0,0.30),
+        inset 0 1px 0 rgba(0,0,0,0.10);
+    }}
+    button.secondary {{ background: linear-gradient(180deg, rgba(255,255,255,0.10) 0%, rgba(0,0,0,0.10) 100%), var(--btn2); }}
+    button:disabled {{ opacity: 0.5; cursor: not-allowed; transform: none; }}
+    #send {{
+      background: linear-gradient(180deg, rgba(255,255,255,0.15) 0%, rgba(0,0,0,0.08) 100%), linear-gradient(135deg, #1f6feb 0%, #2d8cf0 100%);
+      transform: translateY(-2px);
+      box-shadow:
+        0 6px 20px rgba(31,111,235,0.45),
+        0 2px 6px rgba(0,0,0,0.28),
+        inset 0 1px 0 rgba(255,255,255,0.28),
+        inset 0 -1px 0 rgba(0,0,0,0.20);
+      padding: 10px 20px;
+    }}
+    #send:hover:not(:disabled) {{
+      transform: translateY(0px);
+      box-shadow:
+        0 2px 8px rgba(31,111,235,0.30),
+        0 1px 3px rgba(0,0,0,0.25),
+        inset 0 1px 0 rgba(255,255,255,0.16),
+        inset 0 2px 4px rgba(0,0,0,0.15);
+    }}
     input[type="text"] {{
       width: 100%;
       background: var(--field);
@@ -1631,19 +1857,44 @@ def ui() -> str:
     }}
     .sess {{
       padding: 10px 10px;
-      border: 1px solid var(--border);
+      border: none;
       border-radius: 10px;
       margin: 8px 0;
       cursor: pointer;
-      background: rgba(0,0,0,0.12);
+      background: linear-gradient(160deg, rgba(255,255,255,0.06) 0%, rgba(0,0,0,0.12) 100%);
       user-select: none;
       display: flex;
       align-items: flex-start;
       justify-content: space-between;
       gap: 10px;
+      transition: transform 0.10s ease, box-shadow 0.10s ease;
+      transform: translateY(-2px);
+      box-shadow:
+        0 5px 14px rgba(0,0,0,0.35),
+        0 2px 5px rgba(0,0,0,0.22),
+        inset 0 1px 0 rgba(255,255,255,0.12);
     }}
-    .sess:hover {{ background: var(--hover); }}
-    .sess.active {{ background: var(--active); border-color: rgba(31,111,235,0.55); }}
+    .sess:hover {{
+      transform: translateY(0px);
+      box-shadow:
+        0 1px 4px rgba(0,0,0,0.28),
+        inset 0 2px 5px rgba(0,0,0,0.20),
+        inset 0 1px 0 rgba(255,255,255,0.06);
+    }}
+    .sess:active {{
+      transform: translateY(2px);
+      box-shadow:
+        0 1px 2px rgba(0,0,0,0.20),
+        inset 0 3px 7px rgba(0,0,0,0.28);
+    }}
+    .sess.active {{
+      background: linear-gradient(160deg, rgba(31,111,235,0.18) 0%, rgba(20,70,180,0.12) 100%);
+      transform: translateY(-2px);
+      box-shadow:
+        0 5px 18px rgba(31,111,235,0.28),
+        0 2px 5px rgba(0,0,0,0.22),
+        inset 0 1px 0 rgba(100,160,255,0.22);
+    }}
     .sessMain {{ min-width: 0; flex: 1; }}
     .sessTitle {{
       font-size: 14px;
@@ -1682,9 +1933,9 @@ def ui() -> str:
     .hint {{ font-size: 11px; color: var(--muted); }}
 
     .main {{
-      height: 100%;
-      display: grid;
-      grid-template-rows: auto 1fr auto;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
       padding: 14px;
       box-sizing: border-box;
       gap: 12px;
@@ -1716,31 +1967,105 @@ def ui() -> str:
       opacity: 0.9;
     }}
     .chat {{
+      flex: 1;
+      min-height: 0;
       overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
       padding-right: 6px;
       overscroll-behavior: contain;
     }}
     .bubble {{
-      padding: 10px 12px;
-      border-radius: 12px;
-      line-height: 1.35;
-      white-space: pre-wrap;
-      border: 1px solid var(--border);
-      max-width: 92%;
+      padding: 14px 20px 14px 20px;
+      line-height: 1.58;
+      max-width: 82%;
+      width: fit-content;
+      display: block;
+      position: relative;
+      overflow: hidden;
+      backdrop-filter: blur(18px) saturate(1.4);
+      -webkit-backdrop-filter: blur(18px) saturate(1.4);
+      transition: transform 0.15s, box-shadow 0.15s;
+      margin-bottom: 10px;
+    }}
+    .bubble:hover {{
+      transform: translateY(-2px);
+    }}
+    /* Straight-on top light — full width band fading down */
+    .bubble::before {{
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 36%;
+      background: linear-gradient(180deg,
+        rgba(255,255,255,0.36) 0%,
+        rgba(255,255,255,0.10) 55%,
+        transparent 100%);
+      border-radius: inherit;
+      pointer-events: none;
+      z-index: 3;
+    }}
+    /* Bottom shadow — ground bounce */
+    .bubble::after {{
+      content: '';
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      height: 22%;
+      background: linear-gradient(0deg,
+        rgba(0,0,0,0.18) 0%,
+        transparent 100%);
+      border-radius: inherit;
+      pointer-events: none;
+      z-index: 3;
+    }}
+    .bubbleText {{ white-space: pre-wrap; position: relative; z-index: 2; font-size: 14px; }}
+    .bubbleMeta {{
+      font-size: 10px;
+      opacity: 0.38;
+      margin-top: 6px;
+      letter-spacing: 0.2px;
+      position: relative;
+      z-index: 2;
     }}
     .user {{
-      background: var(--user);
-      align-self: flex-end;
-      border-color: #2c405c;
+      margin-left: auto;
+      margin-right: 0;
+      border-radius: 22px 22px 5px 22px;
+      border: none;
+      background: linear-gradient(160deg,
+        rgba(180,215,255,0.18) 0%,
+        rgba(60,120,255,0.10) 100%);
+      box-shadow:
+        0 6px 22px rgba(10,50,200,0.28),
+        0 2px 8px rgba(0,0,0,0.40),
+        inset 0 1px 0 rgba(255,255,255,0.40);
+    }}
+    .user .bubbleMeta {{ text-align: right; }}
+    .user .bubbleText {{
+      color: rgba(210, 228, 255, 0.70);
+      text-shadow:
+        0 0 10px rgba(80,150,255,0.55),
+        0 0 28px rgba(40,100,255,0.22),
+        0 1px 3px rgba(0,0,0,0.65);
     }}
     .assistant {{
-      background: var(--assistant);
-      align-self: flex-start;
-      border-color: var(--assistantBorder);
+      margin-left: 0;
+      margin-right: auto;
+      border-radius: 22px 22px 22px 14px;
+      border: none;
+      background: linear-gradient(160deg,
+        rgba(255,95,0,0.34) 0%,
+        rgba(255,50,0,0.20) 100%);
+      box-shadow:
+        3px 6px 20px -2px rgba(255,80,0,0.24),
+        1px 2px 8px rgba(0,0,0,0.38),
+        inset 0 1px 0 rgba(255,255,255,0.38);
     }}
+    .assistant .bubbleText {{
+      color: rgba(255, 215, 170, 0.72);
+      text-shadow:
+        0 0 8px rgba(255,120,20,0.28),
+        0 1px 3px rgba(0,0,0,0.65);
+    }}
+    .assistant .bubbleMeta {{ text-align: left; }}
     .approval {{
       background: var(--warnBg);
       border-color: var(--warnBorder);
@@ -1771,10 +2096,13 @@ def ui() -> str:
       margin-top: 10px;
     }}
     .composer {{
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px;
+      background: rgba(24,30,38,0.92);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 16px;
+      padding: 14px;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.22);
     }}
     textarea {{
       width: 100%;
@@ -1784,32 +2112,138 @@ def ui() -> str:
       color: var(--text);
       border: 1px solid var(--border);
       border-radius: 10px;
-      padding: 10px;
+      padding: 10px 12px;
       box-sizing: border-box;
+      font-family: inherit;
+      font-size: 14px;
+      line-height: 1.5;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }}
+    textarea:focus {{
+      border-color: rgba(31,111,235,0.55);
     }}
     audio {{ display: none; }}
-    .overlay {{
+    /* ---- Full-screen loading screen ---- */
+    #loadScreen {{
       position: fixed;
       inset: 0;
-      background: rgba(0,0,0,0.72);
-      display: none;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
       z-index: 9999;
+      transition: opacity 0.5s ease;
     }}
-    .overlay.show {{ display: flex; }}
-    .overlayCard {{
-      width: min(520px, 92vw);
-      background: #1f242b;
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 18px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+    #loadScreen.fade-out {{
+      opacity: 0;
+      pointer-events: none;
     }}
-    .spinner {{
-      width: 34px;
-      height: 34px;
+    #loadScreen.hidden {{ display: none; }}
+    .loadCard {{
+      width: min(480px, 90vw);
+      display: flex;
+      flex-direction: column;
+      gap: 24px;
+    }}
+    .loadBrand {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }}
+    .loadBrandName {{
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      color: var(--text);
+    }}
+    .loadBrandName span {{
+      color: #1f6feb;
+    }}
+    .loadBrandSub {{
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 500;
+    }}
+    .loadProgressWrap {{
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .loadProgressBar {{
+      width: 100%;
+      height: 4px;
+      background: rgba(255,255,255,0.08);
+      border-radius: 99px;
+      overflow: hidden;
+    }}
+    .loadProgressFill {{
+      height: 100%;
+      border-radius: 99px;
+      background: linear-gradient(90deg, #1f6feb, #2d8cf0);
+      width: 0%;
+      transition: width 0.4s ease;
+      box-shadow: 0 0 8px rgba(31,111,235,0.55);
+    }}
+    .loadProgressFill.indeterminate {{
+      width: 35% !important;
+      animation: loadSlide 1.4s ease-in-out infinite;
+    }}
+    @keyframes loadSlide {{
+      0%   {{ margin-left: -35%; }}
+      100% {{ margin-left: 100%; }}
+    }}
+    .loadStatus {{
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 500;
+      min-height: 18px;
+    }}
+    .loadLog {{
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      max-height: 180px;
+      overflow: hidden;
+    }}
+    .loadLogEntry {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      color: rgba(230,237,243,0.55);
+      animation: logFadeIn 0.3s ease;
+    }}
+    .loadLogEntry.active {{
+      color: var(--text);
+    }}
+    @keyframes logFadeIn {{
+      from {{ opacity: 0; transform: translateY(4px); }}
+      to   {{ opacity: 1; transform: translateY(0); }}
+    }}
+    .loadLogDot {{
+      width: 6px;
+      height: 6px;
       border-radius: 50%;
+      background: rgba(230,237,243,0.25);
+      flex-shrink: 0;
+    }}
+    .loadLogEntry.active .loadLogDot {{
+      background: #1f6feb;
+      box-shadow: 0 0 6px rgba(31,111,235,0.7);
+    }}
+    .loadLogEntry.done .loadLogDot {{
+      background: #3fb950;
+    }}
+    .loadHint {{
+      font-size: 11px;
+      color: rgba(230,237,243,0.3);
+    }}
+    /* Keep old overlay class for any leftover references */
+    .overlay {{ display: none !important; }}
+    .spinner {{
+      width: 34px; height: 34px; border-radius: 50%;
       border: 4px solid rgba(255,255,255,0.18);
       border-top-color: rgba(31,111,235,0.95);
       animation: spin 1s linear infinite;
@@ -1862,60 +2296,30 @@ def ui() -> str:
       50%  {{ box-shadow: 0 0 0 7px rgba(218,54,51,0.08); }}
     }}
 
-    /* Voice Orb */
+    /* Voice Orb — Babylon.js */
     #voiceOrbWrap {{
       display: flex;
       justify-content: center;
       align-items: center;
-      padding: 10px 0 8px;
+      padding: 6px 0 4px;
       width: 100%;
-      background: transparent;
+      background: radial-gradient(ellipse at 50% 50%, rgba(0,0,0,0.18) 0%, rgba(0,0,0,0.42) 100%);
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
     }}
     #voiceOrbContainer {{
       position: relative;
-      width: 150px;
-      height: 150px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      width: 180px;
+      height: 210px;
+      overflow: visible;
     }}
     #orbCanvas {{
-      position: absolute;
-      top: 0; left: 0;
-      pointer-events: none;
-      z-index: 0;
+      width: 180px;
+      height: 210px;
       background: transparent;
-    }}
-    #voiceOrb {{
-      width: 64px;
-      height: 64px;
-      border-radius: 50%;
+      display: block;
       position: relative;
-      z-index: 1;
-      background: radial-gradient(circle at 30% 30%, rgba(255,165,70,0.80), rgba(200,75,10,0.88) 55%, rgba(55,18,3,0.92));
-      box-shadow: 0 0 16px 5px rgba(210,100,20,0.32);
-      animation: orbIdle 3s ease-in-out infinite;
-      transition: background 0.4s ease, box-shadow 0.4s ease;
-    }}
-    #voiceOrb.user-speaking {{
-      background: radial-gradient(circle at 35% 35%, #60b4ff, #1a6fd4 55%, #0a3a7a);
-      box-shadow: 0 0 24px 8px rgba(60,140,255,0.45), 0 0 44px 14px rgba(30,100,220,0.18);
-      animation: orbPulse 0.9s ease-in-out infinite;
-    }}
-    #voiceOrb.llm-speaking {{
-      background: radial-gradient(circle at 35% 35%, #ffcc66, #e87c20 55%, #7a3600);
-      box-shadow: 0 0 24px 8px rgba(240,140,40,0.50), 0 0 44px 14px rgba(200,100,20,0.20);
-      animation: orbPulse 1.1s ease-in-out infinite;
-    }}
-    @keyframes orbIdle {{
-      0%, 100% {{ transform: scale(1);    box-shadow: 0 0 16px 5px rgba(210,100,20,0.30); }}
-      50%       {{ transform: scale(1.04); box-shadow: 0 0 24px 8px rgba(210,100,20,0.45); }}
-    }}
-    @keyframes orbPulse {{
-      0%, 100% {{ transform: scale(1);    }}
-      50%       {{ transform: scale(1.10); }}
+      z-index: 5;
     }}
 
     /* Waveform speaking indicator */
@@ -1992,25 +2396,27 @@ def ui() -> str:
 </head>
 <body>
 
-<div id="overlay" class="overlay">
-  <div class="overlayCard">
-    <div class="row" style="align-items:center;">
-      <div class="spinner"></div>
-      <div>
-        <div style="font-weight:700; font-size:16px;">Warming up…</div>
-        <div class="small" id="warmDetail">Starting…</div>
-      </div>
+<div id="loadScreen">
+  <div class="loadCard">
+    <div class="loadBrand">
+      <div class="loadBrandName">{APP_NAME.split()[0]}<span>{APP_NAME[len(APP_NAME.split()[0]):]}</span></div>
+      <div class="loadBrandSub">{APP_VERSION} &nbsp;·&nbsp; Local AI Voice Agent</div>
     </div>
-    <div class="small" style="margin-top:10px;">You can view the UI, but it will unlock when models are ready.</div>
+    <div class="loadProgressWrap">
+      <div class="loadProgressBar"><div class="loadProgressFill indeterminate" id="loadFill"></div></div>
+      <div class="loadStatus" id="loadStatus">Starting…</div>
+    </div>
+    <div class="loadLog" id="loadLog"></div>
+    <div class="loadHint">Starting services — this only happens once per session</div>
   </div>
 </div>
+<div id="overlay" class="overlay"></div>
 
 <div class="app" id="appRoot">
   <div class="sidebar">
     <div id="voiceOrbWrap">
       <div id="voiceOrbContainer">
-        <canvas id="orbCanvas" width="150" height="150"></canvas>
-        <div id="voiceOrb"></div>
+        <canvas id="orbCanvas" width="180" height="180"></canvas>
       </div>
     </div>
     <div class="sidebarHeader">
@@ -2068,9 +2474,9 @@ def ui() -> str:
         <textarea id="msg" placeholder="Type... (Enter to send • Shift+Enter for newline)"></textarea>
       </div>
       <div class="row" style="margin-top:10px; justify-content:flex-end;">
-        <button class="secondary" id="micBtn" title="Toggle voice input">🎤</button>
-        <button class="secondary" id="voiceLast">Voice Last</button>
-        <button id="send">Send</button>
+        <button class="secondary" id="micBtn" title="Toggle voice input"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg></button>
+        <button class="secondary" id="voiceLast"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg> Voice Last</button>
+        <button id="send"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg> Send</button>
       </div>
       <audio id="player"></audio>
     </div>
@@ -2083,47 +2489,77 @@ const AUTO_VOICE_DEFAULT_ON = {str(AUTO_VOICE_DEFAULT_ON).lower()};
 const APP_NAME = {json.dumps(APP_NAME)};
 const APP_VERSION = {json.dumps(APP_VERSION)};
 
-const overlay = document.getElementById("overlay");
-const warmDetail = document.getElementById("warmDetail");
 const appRoot = document.getElementById("appRoot");
+const loadScreen = document.getElementById("loadScreen");
+const loadFill = document.getElementById("loadFill");
+const loadStatus = document.getElementById("loadStatus");
+const loadLog = document.getElementById("loadLog");
 
-function setLocked(locked) {{
-  if (locked) {{
-    overlay.classList.add("show");
-    appRoot.style.pointerEvents = "none";
-    appRoot.style.filter = "blur(0.6px)";
-  }} else {{
-    overlay.classList.remove("show");
-    appRoot.style.pointerEvents = "auto";
-    appRoot.style.filter = "none";
+let _lastDetail = "";
+let _logEntries = [];
+
+function _addLogEntry(text) {{
+  // Mark previous active entry as done
+  const prev = loadLog.querySelector(".loadLogEntry.active");
+  if (prev) {{ prev.classList.remove("active"); prev.classList.add("done"); }}
+
+  const entry = document.createElement("div");
+  entry.className = "loadLogEntry active";
+  entry.innerHTML = '<div class="loadLogDot"></div><span>' + text + '</span>';
+  loadLog.appendChild(entry);
+  _logEntries.push(entry);
+
+  // Keep only last 5 visible
+  if (_logEntries.length > 5) {{
+    const old = _logEntries.shift();
+    old.style.transition = "opacity 0.3s ease";
+    old.style.opacity = "0";
+    setTimeout(() => old.remove(), 300);
   }}
 }}
 
-async function pollReadyOnce() {{
-  try {{
-    const r = await fetch("/api/ready");
-    const j = await r.json();
-    warmDetail.textContent = j.detail || "Starting…";
-    if (j.ready) {{
-      setLocked(false);
-      return true;
-    }} else {{
-      setLocked(true);
-      return false;
-    }}
-  }} catch (e) {{
-    warmDetail.textContent = "Connecting…";
-    setLocked(true);
-    return false;
+function _setProgress(pct, detail) {{
+  if (pct >= 100) {{
+    loadFill.classList.remove("indeterminate");
+    loadFill.style.width = "100%";
+  }} else if (pct > 0) {{
+    loadFill.classList.remove("indeterminate");
+    loadFill.style.width = pct + "%";
+  }}
+  loadStatus.textContent = detail || "";
+  if (detail && detail !== _lastDetail) {{
+    _lastDetail = detail;
+    _addLogEntry(detail);
   }}
 }}
+
+function _dismissLoadScreen() {{
+  loadScreen.classList.add("fade-out");
+  appRoot.style.pointerEvents = "auto";
+  appRoot.style.filter = "none";
+  setTimeout(() => loadScreen.classList.add("hidden"), 520);
+}}
+
+// Hide app until ready
+appRoot.style.pointerEvents = "none";
 
 (async () => {{
-  await pollReadyOnce();
+  _addLogEntry("Connecting…");
   while (true) {{
-    const ok = await pollReadyOnce();
-    if (ok) break;
-    await new Promise(res => setTimeout(res, 250));
+    try {{
+      const r = await fetch("/api/ready");
+      const j = await r.json();
+      _setProgress(j.progress ?? 0, j.detail || "Starting…");
+      if (j.ready) {{
+        _setProgress(100, "Ready");
+        await new Promise(res => setTimeout(res, 400));
+        _dismissLoadScreen();
+        break;
+      }}
+    }} catch (e) {{
+      loadStatus.textContent = "Connecting…";
+    }}
+    await new Promise(res => setTimeout(res, 300));
   }}
 }})();
 
@@ -2241,7 +2677,14 @@ function fmtTime(ts) {{
 function addBubble(role, text) {{
   const div = document.createElement("div");
   div.className = "bubble " + (role === "user" ? "user" : "assistant");
-  div.textContent = text;
+  const content = document.createElement("div");
+  content.className = "bubbleText";
+  content.textContent = text;
+  const meta = document.createElement("div");
+  meta.className = "bubbleMeta";
+  meta.textContent = new Date().toLocaleTimeString([], {{hour:"2-digit", minute:"2-digit"}});
+  div.appendChild(content);
+  div.appendChild(meta);
   chatEl.appendChild(div);
 
   while (chatEl.children.length > UI_MAX_BUBBLES) {{
@@ -2328,87 +2771,185 @@ function clearChat() {{
 }}
 
 const waveform = document.getElementById("waveform");
-const voiceOrbWrap = document.getElementById("voiceOrbWrap");
-const voiceOrb = document.getElementById("voiceOrb");
-const orbCanvas = document.getElementById("orbCanvas");
-const orbCtx = orbCanvas.getContext("2d");
 
-// ---- Orb particle system ----
-const _ORB_R = 32, _CANVAS_SZ = 150;
-let _orbParticles = [], _orbAnimFrame = null, _orbState = "idle";
+// ---- Babylon.js Voice Orb ----
+(function() {{
+  const canvas = document.getElementById("orbCanvas");
+  const engine = new BABYLON.Engine(canvas, true, {{ preserveDrawingBuffer: true, stencil: true, alpha: true }});
+  const scene = new BABYLON.Scene(engine);
+  scene.clearColor = new BABYLON.Color4(0, 0, 0, 0);
 
-function _makeParticle(state) {{
-  const idle = state === "idle";
-  return {{
-    angle: Math.random() * Math.PI * 2,
-    radius: idle ? _ORB_R + 8 + Math.random() * 16 : _ORB_R + 10 + Math.random() * 28,
-    speed: (idle ? 0.004 + Math.random() * 0.006 : 0.011 + Math.random() * 0.022) * (Math.random() < 0.5 ? 1 : -1),
-    size: idle ? 1.0 + Math.random() * 1.4 : 1.4 + Math.random() * 2.4,
-    opacity: idle ? 0.15 + Math.random() * 0.22 : 0.35 + Math.random() * 0.55,
-    drift: (Math.random() - 0.5) * (idle ? 0.001 : 0.005),
+  // Fixed camera — no user interaction
+  const camera = new BABYLON.ArcRotateCamera("cam", -Math.PI / 2, Math.PI / 2, 3.8, BABYLON.Vector3.Zero(), scene);
+  camera.lowerRadiusLimit = camera.upperRadiusLimit = 3.8;
+  camera.detachControl();
+
+  // Key light — top-front-right (matches UI light direction)
+  const keyLight = new BABYLON.PointLight("key", new BABYLON.Vector3(2.0, 1.8, -3.0), scene);
+  keyLight.diffuse = new BABYLON.Color3(1.0, 0.90, 0.72);
+  keyLight.specular = new BABYLON.Color3(1.0, 0.95, 0.85);
+  keyLight.intensity = 1.4;
+
+  // Subtle specular — soft amber tint only, no harsh white hotspot
+  const specLight = new BABYLON.PointLight("spec", new BABYLON.Vector3(2.6, 1.1, -3.5), scene);
+  specLight.diffuse = new BABYLON.Color3(0.0, 0.0, 0.0);
+  specLight.specular = new BABYLON.Color3(0.55, 0.30, 0.08);
+  specLight.intensity = 1.0;
+
+  // Cool rim/fill light (back-left)
+  const fillLight = new BABYLON.HemisphericLight("fill", new BABYLON.Vector3(-1, 0.5, 1), scene);
+  fillLight.diffuse = new BABYLON.Color3(0.18, 0.26, 0.45);
+  fillLight.groundColor = new BABYLON.Color3(0.04, 0.04, 0.08);
+  fillLight.intensity = 0.22;
+
+  // Sphere
+  const orb = BABYLON.MeshBuilder.CreateSphere("orb", {{ diameter: 1.5, segments: 48 }}, scene);
+
+  // StandardMaterial — Phong specular + Fresnel rim glow
+  const mat = new BABYLON.StandardMaterial("mat", scene);
+  mat.diffuseColor   = new BABYLON.Color3(0.45, 0.16, 0.02);
+  mat.emissiveColor  = new BABYLON.Color3(0.22, 0.07, 0.01);
+  mat.specularColor  = new BABYLON.Color3(1.0, 0.95, 0.85);
+  mat.specularPower  = 192;
+
+  // Fresnel — edges glow brighter, center goes deeper/darker
+  mat.emissiveFresnelParameters = new BABYLON.FresnelParameters();
+  mat.emissiveFresnelParameters.bias      = 0.3;
+  mat.emissiveFresnelParameters.power     = 3;
+  mat.emissiveFresnelParameters.leftColor  = new BABYLON.Color3(1.0, 0.55, 0.12);  // bright rim
+  mat.emissiveFresnelParameters.rightColor = new BABYLON.Color3(0.05, 0.01, 0.0);  // dark center
+
+  // Opacity Fresnel — slightly transparent at center, opaque at rim
+  mat.opacityFresnelParameters = new BABYLON.FresnelParameters();
+  mat.opacityFresnelParameters.leftColor  = BABYLON.Color3.White();
+  mat.opacityFresnelParameters.rightColor = new BABYLON.Color3(0.7, 0.7, 0.7);
+
+  orb.material = mat;
+
+  // Bloom glow layer
+  const gl = new BABYLON.GlowLayer("glow", scene, {{ mainTextureRatio: 0.5 }});
+  gl.intensity = 1.4;
+  gl.blurKernelSize = 64;
+  gl.addIncludedOnlyMesh(orb);
+
+  // Soft radial particle texture
+  const ptex = new BABYLON.DynamicTexture("ptex", 64, scene, false);
+  const pctx = ptex.getContext();
+  const grad = pctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grad.addColorStop(0,   "rgba(255,200,120,1)");
+  grad.addColorStop(0.4, "rgba(255,130,40,0.55)");
+  grad.addColorStop(1,   "rgba(0,0,0,0)");
+  pctx.fillStyle = grad;
+  pctx.fillRect(0, 0, 64, 64);
+  ptex.update();
+
+  // Particle system
+  const ps = new BABYLON.ParticleSystem("ps", 280, scene);
+  ps.particleTexture  = ptex;
+  ps.emitter          = orb;
+  ps.minEmitBox       = new BABYLON.Vector3(0, 0, 0);
+  ps.maxEmitBox       = new BABYLON.Vector3(0, 0, 0);
+  ps.color1           = new BABYLON.Color4(1.0, 0.55, 0.12, 0.9);
+  ps.color2           = new BABYLON.Color4(0.8, 0.32, 0.05, 0.5);
+  ps.colorDead        = new BABYLON.Color4(0, 0, 0, 0);
+  ps.minSize          = 0.022; ps.maxSize     = 0.068;
+  ps.minLifeTime      = 1.8;   ps.maxLifeTime = 3.6;
+  ps.emitRate         = 38;
+  ps.blendMode        = BABYLON.ParticleSystem.BLENDMODE_ADD;
+  ps.gravity          = new BABYLON.Vector3(0, 0.018, 0);
+  ps.direction1       = new BABYLON.Vector3(-0.6, -0.6, -2.2);
+  ps.direction2       = new BABYLON.Vector3(0.6,  0.6,  -0.4);
+  ps.minAngularSpeed  = -0.5; ps.maxAngularSpeed = 0.5;
+  ps.minEmitPower     = 0.8;  ps.maxEmitPower    = 2.0;
+  ps.updateSpeed      = 0.012;
+  ps.start();
+
+  // State definitions
+  const S = {{
+    idle: {{
+      diffuse:  new BABYLON.Color3(0.45, 0.16, 0.02),
+      emissive: new BABYLON.Color3(0.22, 0.07, 0.01),
+      rimCol:   new BABYLON.Color3(1.0,  0.55, 0.12),
+      keyCol:   new BABYLON.Color3(1.0,  0.88, 0.68),
+      glow: 1.4, pulse: 0.7,  pulseAmt: 0.022,
+      pc1: new BABYLON.Color4(1.0, 0.65, 0.18, 1.0), pRate: 55,
+    }},
+    user: {{
+      diffuse:  new BABYLON.Color3(0.08, 0.35, 0.90),
+      emissive: new BABYLON.Color3(0.04, 0.14, 0.42),
+      rimCol:   new BABYLON.Color3(0.28, 0.70, 1.0),
+      keyCol:   new BABYLON.Color3(0.5,  0.75, 1.0),
+      glow: 1.35, pulse: 0.65, pulseAmt: 0.055,
+      pc1: new BABYLON.Color4(0.28, 0.62, 1.0, 0.92), pRate: 95,
+    }},
+    llm: {{
+      diffuse:  new BABYLON.Color3(0.90, 0.42, 0.04),
+      emissive: new BABYLON.Color3(0.44, 0.14, 0.01),
+      rimCol:   new BABYLON.Color3(1.0,  0.70, 0.20),
+      keyCol:   new BABYLON.Color3(1.0,  0.85, 0.52),
+      glow: 1.15, pulse: 0.65, pulseAmt: 0.055,
+      pc1: new BABYLON.Color4(1.0, 0.62, 0.18, 0.92), pRate: 78,
+    }},
   }};
-}}
 
-function _spawnParticles(state) {{
-  const count = state === "idle" ? 20 : 32;
-  _orbParticles = Array.from({{ length: count }}, () => _makeParticle(state));
-}}
+  let _tgt = S.idle, _t = 0, _smoothedAudio = 0;
+  const _lc = (a, b, k) => new BABYLON.Color3(a.r+(b.r-a.r)*k, a.g+(b.g-a.g)*k, a.b+(b.b-a.b)*k);
 
-function _orbDraw() {{
-  orbCtx.clearRect(0, 0, _CANVAS_SZ, _CANVAS_SZ);
-  const cx = _CANVAS_SZ / 2, cy = _CANVAS_SZ / 2;
-  const col = _orbState === "user" ? "rgba(80,160,255," : _orbState === "llm" ? "rgba(240,140,40," : "rgba(220,110,20,";
-  const minR = _ORB_R + 8;
-  const maxR = _orbState === "idle" ? _ORB_R + 24 : _ORB_R + 40;
-  for (const p of _orbParticles) {{
-    p.angle += p.speed;
-    p.radius += p.drift;
-    if (p.radius < minR) p.radius = minR;
-    if (p.radius > maxR) p.radius = maxR;
-    const x = cx + Math.cos(p.angle) * p.radius;
-    const y = cy + Math.sin(p.angle) * p.radius;
-    orbCtx.beginPath();
-    orbCtx.arc(x, y, p.size, 0, Math.PI * 2);
-    orbCtx.fillStyle = col + p.opacity + ")";
-    orbCtx.fill();
+  function _rmsLevel(analyser) {{
+    if (!analyser) return 0;
+    const d = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(d);
+    let s = 0;
+    for (let i = 0; i < d.length; i++) {{ const v = (d[i] - 128) / 128; s += v * v; }}
+    return Math.sqrt(s / d.length);
   }}
-  _orbAnimFrame = requestAnimationFrame(_orbDraw);
-}}
 
-function _startParticles(state) {{
-  const changed = _orbState !== state;
-  _orbState = state;
-  if (!_orbParticles.length) {{
-    _spawnParticles(state);
-  }} else if (changed) {{
-    const idle = state === "idle";
-    for (const p of _orbParticles) {{
-      p.speed = (idle ? 0.004 + Math.random() * 0.006 : 0.011 + Math.random() * 0.022) * (p.speed < 0 ? -1 : 1);
-      p.drift = (Math.random() - 0.5) * (idle ? 0.001 : 0.005);
-      p.size  = idle ? 1.0 + Math.random() * 1.4 : 1.4 + Math.random() * 2.4;
-      p.opacity = idle ? 0.15 + Math.random() * 0.22 : 0.35 + Math.random() * 0.55;
+  scene.registerBeforeRender(() => {{
+    _t += engine.getDeltaTime() * 0.001;
+    const T = _tgt, k = 0.055;
+    mat.diffuseColor  = _lc(mat.diffuseColor,  T.diffuse,  k);
+    mat.emissiveColor = _lc(mat.emissiveColor,  T.emissive, k);
+    mat.emissiveFresnelParameters.leftColor = _lc(mat.emissiveFresnelParameters.leftColor, T.rimCol, k);
+    keyLight.diffuse  = _lc(keyLight.diffuse,   T.keyCol,   k);
+    gl.intensity     += (T.glow   - gl.intensity)  * k;
+    ps.emitRate      += (T.pRate  - ps.emitRate)   * k;
+    ps.color1         = T.pc1;
+    const state = window._orbState || 'idle';
+    let raw = 0;
+    if (state === 'user') raw = _rmsLevel(window._micAnalyser);
+    if (state === 'llm')  raw = _rmsLevel(window._ttsAnalyser);
+    _smoothedAudio += (raw - _smoothedAudio) * 0.4;
+    if (state === 'idle') {{
+      orb.scaling.setAll(1.0 + Math.sin(_t * T.pulse * Math.PI * 2) * T.pulseAmt);
+    }} else {{
+      // Amplify the small RMS values with a power curve, then scale up
+      const boosted = Math.pow(Math.min(_smoothedAudio * 8, 1.0), 0.6);
+      orb.scaling.setAll(1.0 + Math.sin(_t * 0.4 * Math.PI * 2) * 0.018 + boosted * 0.22);
     }}
-    if (!idle) {{
-      while (_orbParticles.length < 32) _orbParticles.push(_makeParticle(state));
-    }}
-  }}
-  if (!_orbAnimFrame) _orbDraw();
-}}
+  }});
 
-function _stopParticles() {{
-  _orbState = "idle";
-  if (_orbAnimFrame) {{ cancelAnimationFrame(_orbAnimFrame); _orbAnimFrame = null; }}
-  orbCtx.clearRect(0, 0, _CANVAS_SZ, _CANVAS_SZ);
-  _orbParticles = [];
-}}
+  engine.runRenderLoop(() => scene.render());
+  window.addEventListener("resize", () => engine.resize());
 
-// Orb always visible — start idle particles immediately on load
-_startParticles("idle");
+  window._orbSetState = (s) => {{ _tgt = S[s] || S.idle; window._orbState = s; }};
+}})();
 
 let _isTTSPlaying = false;
-player.addEventListener("play",  () => {{ waveform.classList.add("speaking"); _isTTSPlaying = true; voiceOrb.classList.remove("user-speaking"); voiceOrb.classList.add("llm-speaking"); _startParticles("llm"); }});
-player.addEventListener("ended", () => {{ waveform.classList.remove("speaking"); _isTTSPlaying = false; voiceOrb.classList.remove("llm-speaking"); _startParticles("idle"); _processQueuedSpeech(); }});
-player.addEventListener("pause", () => {{ waveform.classList.remove("speaking"); _isTTSPlaying = false; voiceOrb.classList.remove("llm-speaking"); _startParticles("idle"); }});
+let _ttsAudioCtx = null;
+function _initTTSAnalyser() {{
+  if (_ttsAudioCtx) {{ _ttsAudioCtx.resume(); return; }}
+  try {{
+    _ttsAudioCtx = new AudioContext();
+    const src = _ttsAudioCtx.createMediaElementSource(player);
+    window._ttsAnalyser = _ttsAudioCtx.createAnalyser();
+    window._ttsAnalyser.fftSize = 256;
+    src.connect(window._ttsAnalyser);
+    src.connect(_ttsAudioCtx.destination);
+  }} catch(e) {{ console.warn("TTS analyser init failed:", e); }}
+}}
+player.addEventListener("play",  () => {{ waveform.classList.add("speaking");    _isTTSPlaying = true;  _initTTSAnalyser(); _orbSetState("llm"); }});
+player.addEventListener("ended", () => {{ waveform.classList.remove("speaking"); _isTTSPlaying = false; _orbSetState("idle"); _processQueuedSpeech(); }});
+player.addEventListener("pause", () => {{ waveform.classList.remove("speaking"); _isTTSPlaying = false; _orbSetState("idle"); }});
 
 function playUrl(url) {{
   player.pause();
@@ -2500,8 +3041,7 @@ function _vadTick() {{
       _isSpeechActive = true;
       _speechStartTime = now;
       _micChunks = [];
-      voiceOrb.classList.add("user-speaking");
-      _startParticles("user");
+      _orbSetState("user");
     }}
   }} else if (_isSpeechActive) {{
     if (!_silenceStartTime) _silenceStartTime = now;
@@ -2509,8 +3049,7 @@ function _vadTick() {{
     const speechDur = (_silenceStartTime || now) - (_speechStartTime || now);
     if (silenced >= SILENCE_SEND_MS && speechDur >= MIN_SPEECH_MS) {{
       _isSpeechActive = false;
-      voiceOrb.classList.remove("user-speaking");
-      _startParticles("idle");
+      _orbSetState("idle");
       const chunks = [..._micChunks];
       _micChunks = [];
       _silenceStartTime = null;
@@ -2530,7 +3069,8 @@ async function _enableVoiceMode() {{
   _mediaStream = await navigator.mediaDevices.getUserMedia({{ audio: true }});
   const source = _audioCtx.createMediaStreamSource(_mediaStream);
   _analyser    = _audioCtx.createAnalyser();
-  _analyser.fftSize = 2048;
+  _analyser.fftSize = 256;
+  window._micAnalyser = _analyser;
   _scriptProc  = _audioCtx.createScriptProcessor(4096, 1, 1);
   _micChunks   = [];
   _scriptProc.onaudioprocess = (e) => {{
@@ -2544,7 +3084,7 @@ async function _enableVoiceMode() {{
   micBtn.classList.add("recording");
   micBtn.title = "Voice mode ON — click to disable";
   statusEl.textContent = "Listening...";
-  _startParticles("idle");
+  _orbSetState("idle");
 }}
 
 function _disableVoiceMode() {{
@@ -2556,8 +3096,7 @@ function _disableVoiceMode() {{
   micBtn.classList.remove("recording");
   micBtn.title = "Toggle voice input";
   statusEl.textContent = "";
-  voiceOrb.classList.remove("user-speaking", "llm-speaking");
-  _startParticles("idle");
+  _orbSetState("idle");
 }}
 
 micBtn.addEventListener("click", async () => {{
@@ -2828,9 +3367,8 @@ async function doSend() {{
       playUrl(data.audio_url);
       // orb handled by player play/ended events
     }} else {{
-      voiceOrb.classList.add("llm-speaking");
-      _startParticles("llm");
-      setTimeout(() => {{ voiceOrb.classList.remove("llm-speaking"); _startParticles("idle"); }}, 2000);
+      _orbSetState("llm");
+      setTimeout(() => _orbSetState("idle"), 2000);
     }}
     _statusReset();
     await refreshSessions();
@@ -2881,6 +3419,45 @@ searchEl.addEventListener("input", () => {{
   }} catch (e) {{
     statusEl.textContent = "Init error: " + e.message;
   }}
+}})();
+
+// Twinkling starfield — covers entire app background
+(function() {{
+  const c = document.createElement('canvas');
+  c.id = 'starfield';
+  c.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;';
+  document.body.insertBefore(c, document.body.firstChild);
+  const ctx = c.getContext('2d');
+  const stars = [];
+  const N = 140;
+  function resize() {{ c.width = window.innerWidth; c.height = window.innerHeight; }}
+  resize();
+  window.addEventListener('resize', resize);
+  for (let i = 0; i < N; i++) {{
+    stars.push({{
+      x: Math.random(),
+      y: Math.random(),
+      r: Math.random() * 1.0 + 0.25,
+      phase: Math.random() * Math.PI * 2,
+      speed: Math.random() * 0.35 + 0.12,
+      warm: Math.random() > 0.6,
+    }});
+  }}
+  function draw(t) {{
+    ctx.clearRect(0, 0, c.width, c.height);
+    const ts = t * 0.001;
+    for (const s of stars) {{
+      const a = 0.08 + 0.55 * (0.5 + 0.5 * Math.sin(ts * s.speed + s.phase));
+      ctx.beginPath();
+      ctx.arc(s.x * c.width, s.y * c.height, s.r, 0, Math.PI * 2);
+      ctx.fillStyle = s.warm
+        ? `rgba(255,220,160,${{a.toFixed(3)}})`
+        : `rgba(180,210,255,${{a.toFixed(3)}})`;
+      ctx.fill();
+    }}
+    requestAnimationFrame(draw);
+  }}
+  requestAnimationFrame(draw);
 }})();
 </script>
 </body>

@@ -1,22 +1,20 @@
-# Aegis AI — Local Voice Agent
+# Aegis AI Agent — Local Voice Agent
 
+![Version](https://img.shields.io/badge/version-v1.2.2-blue)
 ![Status](https://img.shields.io/badge/status-active%20development-blue)
 ![Python](https://img.shields.io/badge/python-3.12-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-A locally-running AI voice agent with an agentic tool loop, sandboxed filesystem access, and a clean browser UI. All inference runs on-device via Ollama — no cloud APIs, no subscriptions.
+A locally-running AI voice agent with an agentic tool loop, sandboxed filesystem access, and a native desktop UI. All inference runs on-device via Ollama — no cloud APIs, no subscriptions.
 
-## Screenshots
+![Aegis AI Agent](docs/screenshot.png)
 
-<p align="center">
-  <img src="data/ref/Screenshot 2026-04-11 104311.png" alt="Aegis AI chat UI with animated voice orb" width="700"/>
-</p>
-<p align="center"><em>Chat UI — animated voice orb in sidebar, Auto Voice toggle, Kokoro TTS speaks every reply</em></p>
+## What's New in v1.2.2
 
-<p align="center">
-  <img src="data/ref/Screenshot 2026-04-11 111029.png" alt="Agentic tool loop with approval prompt" width="700"/>
-</p>
-<p align="center"><em>Agentic tool loop — collapsible tool timeline and risky-tool approval gate (Deny / Approve)</em></p>
+- **Native desktop app** — Tauri window with a 3D Babylon.js voice orb, audio-reactive pulse, and starfield background
+- **Voice I/O** — Kokoro TTS speaks every reply; mic VAD detects speech automatically
+- **Glassy chat bubbles** — Glassmorphism bubbles with directional tails, backdrop blur, and per-message timestamps
+- **Session sidebar** — Persistent named sessions with search, rename, and burn (delete), with its own independent scroll
 
 ## Features
 

@@ -1,0 +1,38 @@
+{
+  "productName": "Aegis AI",
+  "version": "1.2.2",
+  "identifier": "ai.aegis.local",
+  "build": {
+    "devUrl": "http://127.0.0.1:8000/ui",
+    "frontendDist": "http://127.0.0.1:8000/ui"
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Aegis AI",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true,
+        "resizable": true,
+        "decorations": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {}
+}
